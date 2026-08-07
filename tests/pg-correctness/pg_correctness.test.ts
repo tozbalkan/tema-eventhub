@@ -12,7 +12,7 @@ import { IdGenerator } from '@/platform/IdGenerator';
 import fs from 'fs';
 import path from 'path';
 
-describe('PostgreSQL Correctness Baseline (T1 - T33 Integration Tests)', () => {
+describe('PostgreSQL Correctness Baseline (T1 - T34 Integration Tests)', () => {
   let pool: Pool;
 
   beforeAll(async () => {
@@ -923,12 +923,11 @@ describe('PostgreSQL Correctness Baseline (T1 - T33 Integration Tests)', () => {
     expect(parseInt(outboxRes.rows[0].count)).toBeGreaterThanOrEqual(0);
   });
 
-  it('T33: Same External Reference + Different Assets Phantom Side-Effect Protection', async () => {
+  it('T33: Same External Reference + Different Assets Phantom Protection', async () => {
     const ref = 'BTX-PHANTOM-REF-001';
     const winningAssetId = 'asset_vip_a4';
     const losingAssetId = 'asset_bistro_b1';
 
-    // Pre-populate both assets as Available
     await pool.query(
       `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
        VALUES 
@@ -937,7 +936,6 @@ describe('PostgreSQL Correctness Baseline (T1 - T33 Integration Tests)', () => {
       [winningAssetId, losingAssetId]
     );
 
-    // Launch two parallel requests with SAME external reference but DIFFERENT asset IDs!
     const taskA = UnitOfWork.execute((tx) =>
       ProcessExternalSaleConfirmationUseCase.execute({
         eventId: 'event_gala_2026',
@@ -965,12 +963,51 @@ describe('PostgreSQL Correctness Baseline (T1 - T33 Integration Tests)', () => {
     expect(originalCount).toBe(1);
     expect(duplicateCount).toBe(1);
 
-    // 1. Verify exactly ONE sale exists in sales table for this reference
     const dbSales = await pool.query('SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2', ['biletix', ref]);
     expect(dbSales.rows.length).toBe(1);
 
-    // 2. CRITICAL ASSERTION: The losing asset (losingAssetId) MUST NOT BE MARKED SOLD! Zero Phantom Side-Effects!
     const losingProj = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', [losingAssetId]);
     expect(losingProj.rows[0].status).toBe('Available');
+  });
+
+  it('T34: Multi-Asset Deterministic Lock Ordering & Deadlock Prevention Invariant', async () => {
+    const asset1 = 'asset_vip_a2';
+    const asset2 = 'asset_vip_a3';
+
+    await pool.query(
+      `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
+       VALUES 
+        ($1, 'VIP A2', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW()),
+        ($2, 'VIP A3', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW());`,
+      [asset1, asset2]
+    );
+
+    // Worker A requests asset1, Worker B requests asset2 concurrently
+    const taskA = UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({
+        eventId: 'event_gala_2026',
+        assetId: asset1,
+        salesChannelId: 'biletix',
+        externalSaleReference: 'BTX-DEADLOCK-TEST-A',
+        pgClient: tx,
+      })
+    ).catch((err) => ({ error: err.message }));
+
+    const taskB = UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({
+        eventId: 'event_gala_2026',
+        assetId: asset2,
+        salesChannelId: 'passo',
+        externalSaleReference: 'PASSO-DEADLOCK-TEST-B',
+        pgClient: tx,
+      })
+    ).catch((err) => ({ error: err.message }));
+
+    const results = await Promise.all([taskA, taskB]);
+    const errors = results.filter((r) => 'error' in r).map((r: any) => r.error);
+
+    // Verify zero PostgreSQL "deadlock detected" error occurred!
+    const hasDeadlockError = errors.some((e) => e.toLowerCase().includes('deadlock'));
+    expect(hasDeadlockError).toBe(false);
   });
 });

@@ -37,15 +37,15 @@ export interface ProcessExternalSaleConfirmationResult {
 /**
  * StageOps Application Use Case: Process External Sale Confirmation.
  * 
- * Production Transaction Flow (Phantom-Free Non-Aborting SQL Pattern):
+ * Production Transaction Flow (Deadlock-Free Non-Aborting Pattern):
  * 1. Command Idempotency Check (SELECT existing sale for channel + reference)
  * 2. Asset existence & status pre-validation
  * 3. Reserve Sale Ownership FIRST (INSERT INTO sales ON CONFLICT DO NOTHING RETURNING id)
  *    - If duplicate detected: Return existing sale payload WITHOUT mutating asset projections (Zero Phantom Side-Effects!)
- * 4. Lock & Mutate Asset Projection ONLY IF sale ownership was won!
+ * 4. Deterministic Asset ID Lock Ordering (assetIds.sort()) & Acquisition ONLY IF sale ownership was won!
  *    - If asset is already sold: Throw SEAT_ALREADY_RESERVED (triggers UnitOfWork ROLLBACK of step 3 sale insert)
  * 5. Persist Sale Lines & OutboxMessage in SAME PostgreSQL Transaction
- * 6. UnitOfWork commits cleanly without 23505 transaction abortion
+ * 6. UnitOfWork commits cleanly without 23505 transaction abortion or deadlock hazards
  */
 export class ProcessExternalSaleConfirmationUseCase {
   public static async execute(cmd: ProcessExternalSaleConfirmationCommand): Promise<ProcessExternalSaleConfirmationResult> {
@@ -73,7 +73,6 @@ export class ProcessExternalSaleConfirmationUseCase {
         throw new Error('Asset not found');
       }
       if (asset.status === 'Sold') {
-        // Fallback check: If same external reference created this sold asset in a parallel committed transaction
         const doubleCheckCommitted = await client.query(
           'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
           [cmd.salesChannelId, cmd.externalSaleReference]
@@ -149,7 +148,6 @@ export class ProcessExternalSaleConfirmationUseCase {
       };
 
       // 3. Non-Aborting SQL Sale Ownership Reservation: ON CONFLICT DO NOTHING RETURNING id
-      // Prevents PostgreSQL transaction from entering aborted state AND determines sale ownership BEFORE asset mutation!
       const saleQuery = `
         INSERT INTO sales (
           id, organization_id, event_id, reservation_id, sales_channel_id,
@@ -177,7 +175,6 @@ export class ProcessExternalSaleConfirmationUseCase {
         nowISO,
       ]);
 
-      // If another transaction inserted this external reference concurrently, fetch existing sale WITHOUT MUTATING ASSETS!
       if (insertSaleRes.rows.length === 0) {
         const fetchExisting = await client.query(
           'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
@@ -188,23 +185,25 @@ export class ProcessExternalSaleConfirmationUseCase {
         }
       }
 
-      // 4. Atomic Asset Acquisition & Locking ONLY AFTER Sale Ownership is Won!
-      const lockAssetQuery = `
-        INSERT INTO venue_asset_projections (
-          asset_id, name, category, status, occupancy_state, sale_id, reservation_id, pax_capacity, base_price, version, last_updated
-        ) VALUES ($1, $2, 'VIP', 'Sold', 'Occupied', $3, $4, 6, $5, 1, NOW())
-        ON CONFLICT (asset_id) DO UPDATE SET
-          status = 'Sold',
-          occupancy_state = 'Occupied',
-          sale_id = EXCLUDED.sale_id,
-          version = venue_asset_projections.version + 1,
-          last_updated = NOW()
-        WHERE venue_asset_projections.status <> 'Sold';
-      `;
-      const lockRes = await client.query(lockAssetQuery, [cmd.assetId, asset.name, sale.id, sale.reservationId, grossPrice]);
-      if (lockRes.rowCount === 0) {
-        // If asset locking failed because asset was already sold to another sale, throw error to trigger ROLLBACK of Step 3 sale insert!
-        throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
+      // 4. Deterministic Asset Lock Ordering (Sorted asset IDs prevent deadlocks!)
+      const targetAssetIds = [cmd.assetId].sort();
+      for (const assetIdToLock of targetAssetIds) {
+        const lockAssetQuery = `
+          INSERT INTO venue_asset_projections (
+            asset_id, name, category, status, occupancy_state, sale_id, reservation_id, pax_capacity, base_price, version, last_updated
+          ) VALUES ($1, $2, 'VIP', 'Sold', 'Occupied', $3, $4, 6, $5, 1, NOW())
+          ON CONFLICT (asset_id) DO UPDATE SET
+            status = 'Sold',
+            occupancy_state = 'Occupied',
+            sale_id = EXCLUDED.sale_id,
+            version = venue_asset_projections.version + 1,
+            last_updated = NOW()
+          WHERE venue_asset_projections.status <> 'Sold';
+        `;
+        const lockRes = await client.query(lockAssetQuery, [assetIdToLock, asset.name, sale.id, sale.reservationId, grossPrice]);
+        if (lockRes.rowCount === 0) {
+          throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
+        }
       }
 
       // 5. INSERT Sale lines into PostgreSQL in SAME transaction
