@@ -5,7 +5,6 @@ export interface SaleRecordedDomainEvent extends DomainEvent {
   header: EventHeader;
   saleId: string;
   eventId: string;
-  assetId: string;
 }
 
 export interface ReservationPlacedDomainEvent extends DomainEvent {

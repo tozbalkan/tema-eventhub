@@ -7,22 +7,29 @@ import { MockDataStore } from '@/repositories/mock/MockRepositories';
 export class OperationsSaleRecordedHandler {
   public static handle(event: SaleRecordedDomainEvent): void {
     const sale = MockDataStore.sales.find((s) => s.id === event.saleId);
+    if (!sale) return;
 
-    // 1. Update VenueAssetProjection Read Model to Sold
-    VenueAssetProjection.updateAssetStatus(event.assetId, 'Sold', event.saleId, sale?.reservationId);
-    VenueService.updateAsset(event.assetId, { status: 'Sold' });
+    // Support multi-asset sales natively by reading lines from Sale aggregate
+    sale.lines.forEach((line) => {
+      if (!line.venueAssetId) return;
+      const assetId = line.venueAssetId;
 
-    // 2. Set AdmissionRightsProjection
-    const asset = VenueService.getAssetById(event.assetId);
+      // 1. Update VenueAssetProjection Read Model to Sold
+      VenueAssetProjection.updateAssetStatus(assetId, 'Sold', sale.id, sale.reservationId);
+      VenueService.updateAsset(assetId, { status: 'Sold' });
 
-    AdmissionRightsProjection.setRight({
-      assetId: event.assetId,
-      purchaserName: sale?.purchaserSnapshot?.fullName || 'VIP Misafir',
-      isAllowed: true,
-      saleId: event.saleId,
-      reservationId: sale?.reservationId,
-      alreadyAdmittedCount: 0,
-      maxCapacityPax: asset?.paxCapacity || 6,
+      // 2. Set AdmissionRightsProjection
+      const asset = VenueService.getAssetById(assetId);
+
+      AdmissionRightsProjection.setRight({
+        assetId,
+        purchaserName: sale.purchaserSnapshot?.fullName || 'VIP Misafir',
+        isAllowed: true,
+        saleId: sale.id,
+        reservationId: sale.reservationId,
+        alreadyAdmittedCount: 0,
+        maxCapacityPax: asset?.paxCapacity || 6,
+      });
     });
   }
 }

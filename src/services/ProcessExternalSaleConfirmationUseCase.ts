@@ -152,7 +152,6 @@ export class ProcessExternalSaleConfirmationUseCase {
       },
       saleId: sale.id,
       eventId: sale.eventId,
-      assetId: cmd.assetId,
     };
 
     InMemoryEventBus.getInstance().publish(event);
