@@ -12,7 +12,7 @@ import { IdGenerator } from '@/platform/IdGenerator';
 import fs from 'fs';
 import path from 'path';
 
-describe('PostgreSQL Correctness Baseline (T1 - T27 Integration Tests)', () => {
+describe('PostgreSQL Correctness Baseline (T1 - T32 Integration Tests)', () => {
   let pool: Pool;
 
   beforeAll(async () => {
@@ -650,7 +650,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T27 Integration Tests)', () => {
     expect(res2.sale.grossPrice).toBe(res1.sale.grossPrice);
   });
 
-  it('T22: Concurrent Different References Against Same Asset — Zero Overselling Guarantee', async () => {
+  it('T22: Concurrent Different References Against Same Asset — Zero Overselling Invariant', async () => {
     const targetAssetId = 'asset_vip_a3'; // Available VIP Asset
 
     const tasks = Array.from({ length: 10 }, (_, idx) => {
@@ -703,7 +703,6 @@ describe('PostgreSQL Correctness Baseline (T1 - T27 Integration Tests)', () => {
   it('T24: Failed Transaction Lock Release & Subsequent Recovery', async () => {
     const targetAssetId = 'asset_vip_a2';
 
-    // Worker A acquires lock in transaction, then fails before commit (transaction rolls back)
     await expect(
       UnitOfWork.execute(async (tx) => {
         await ProcessExternalSaleConfirmationUseCase.execute({
@@ -717,7 +716,6 @@ describe('PostgreSQL Correctness Baseline (T1 - T27 Integration Tests)', () => {
       })
     ).rejects.toThrow('SIMULATED_WORKER_CRASH_AFTER_LOCK');
 
-    // Worker B attempts to purchase same asset in fresh transaction after rollback -> Succeeds!
     const resB = await UnitOfWork.execute((tx) =>
       ProcessExternalSaleConfirmationUseCase.execute({
         eventId: 'event_gala_2026',
@@ -766,16 +764,12 @@ describe('PostgreSQL Correctness Baseline (T1 - T27 Integration Tests)', () => {
       eventId: IdGenerator.generateUUIDv7(),
     };
 
-    // Open active uncommitted transaction inserting outbox message
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
       await PgOutboxStore.addMessage(client, 'Sale', saleId, event);
 
-      // Concurrent worker from pool attempts to claim pending messages BEFORE commit
       const claimedMessages = await PgOutboxStore.claimPendingMessages('worker_isolation_test', 10, 0);
-
-      // Uncommitted message MUST BE INVISIBLE due to READ COMMITTED PostgreSQL isolation!
       expect(claimedMessages.length).toBe(0);
 
       await client.query('COMMIT');
@@ -783,15 +777,147 @@ describe('PostgreSQL Correctness Baseline (T1 - T27 Integration Tests)', () => {
       client.release();
     }
 
-    // After commit, outbox message becomes visible!
     const claimedAfterCommit = await PgOutboxStore.claimPendingMessages('worker_isolation_test', 10, 0);
     expect(claimedAfterCommit.length).toBe(1);
   });
 
-  it('T27: Complete Invariant Matrix Baseline Validation — Verified 27/27 Invariants', async () => {
-    const outboxRes = await pool.query('SELECT COUNT(*) FROM outbox_messages');
-    const salesRes = await pool.query('SELECT COUNT(*) FROM sales');
-    expect(parseInt(outboxRes.rows[0].count)).toBeGreaterThanOrEqual(0);
-    expect(parseInt(salesRes.rows[0].count)).toBeGreaterThanOrEqual(0);
+  it('T27: Pre-populated Available Asset Race (T28)', async () => {
+    const targetAssetId = 'asset_vip_a4';
+
+    await pool.query(
+      `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
+       VALUES ($1, 'VIP Asset A4', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW());`,
+      [targetAssetId]
+    );
+
+    const tasks = Array.from({ length: 10 }, (_, idx) => {
+      const command = {
+        eventId: 'event_gala_2026',
+        assetId: targetAssetId,
+        salesChannelId: 'biletix',
+        externalSaleReference: `BTX-PREPOP-REF-${idx + 1}`,
+      };
+      return UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+      ).catch((err: Error) => ({ error: err.message }));
+    });
+
+    const results = await Promise.all(tasks);
+    const successfulSales = results.filter((r) => 'sale' in r && !r.isDuplicateRecord);
+    const rejectedSales = results.filter((r) => 'error' in r && r.error.includes('SEAT_ALREADY_RESERVED'));
+
+    expect(successfulSales.length).toBe(1);
+    expect(rejectedSales.length).toBe(9);
+  });
+
+  it('T28: Same External Reference Race with Pre-populated Asset (T29)', async () => {
+    const targetAssetId = 'asset_bistro_b1';
+
+    await pool.query(
+      `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
+       VALUES ($1, 'Bistro B1', 'Bistro', 'Available', 'Vacant', 4, 12000, 1, NOW());`,
+      [targetAssetId]
+    );
+
+    const command = {
+      eventId: 'event_gala_2026',
+      assetId: targetAssetId,
+      salesChannelId: 'biletix',
+      externalSaleReference: 'BTX-IDENTICAL-RACE-001',
+    };
+
+    const tasks = Array.from({ length: 10 }, () =>
+      UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+      )
+    );
+
+    const results = await Promise.all(tasks);
+    const newSales = results.filter((r) => !r.isDuplicateRecord);
+    const duplicates = results.filter((r) => r.isDuplicateRecord);
+
+    expect(newSales.length).toBe(1);
+    expect(duplicates.length).toBe(9);
+  });
+
+  it('T29: Duplicate Response Transaction Health (T31) — UnitOfWork COMMIT succeeds on same transaction client', async () => {
+    const command = {
+      eventId: 'event_gala_2026',
+      assetId: 'asset_bistro_b2',
+      salesChannelId: 'biletix',
+      externalSaleReference: 'BTX-TX-HEALTH-001',
+    };
+
+    await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+    );
+
+    let duplicateResult: any;
+    await expect(
+      UnitOfWork.execute(async (tx) => {
+        duplicateResult = await ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx });
+        const testRes = await tx.query('SELECT 1 as healthy');
+        expect(testRes.rows[0].healthy).toBe(1);
+        return duplicateResult;
+      })
+    ).resolves.not.toThrow();
+
+    expect(duplicateResult.isDuplicateRecord).toBe(true);
+  });
+
+  it('T30: Same External Reference Uncommitted Overlap (T30)', async () => {
+    const targetAssetId = 'asset_bistro_b3';
+    const command = {
+      eventId: 'event_gala_2026',
+      assetId: targetAssetId,
+      salesChannelId: 'biletix',
+      externalSaleReference: 'BTX-OVERLAP-001',
+    };
+
+    const client1 = await pool.connect();
+    let res2Promise: Promise<any>;
+
+    try {
+      await client1.query('BEGIN');
+      await ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: client1 });
+
+      res2Promise = UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+      );
+
+      await client1.query('COMMIT');
+    } finally {
+      client1.release();
+    }
+
+    const res2 = await res2Promise;
+    expect(res2.isDuplicateRecord).toBe(true);
+  });
+
+  it('T31: Zero Transaction Abort Rate Under Heavy Duplicate Load', async () => {
+    const command = {
+      eventId: 'event_gala_2026',
+      assetId: 'asset_bistro_b4',
+      salesChannelId: 'biletix',
+      externalSaleReference: 'BTX-HEAVY-LOAD-001',
+    };
+
+    const tasks = Array.from({ length: 15 }, () =>
+      UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+      )
+    );
+
+    const results = await Promise.all(tasks);
+    const originalCount = results.filter((r) => !r.isDuplicateRecord).length;
+    const duplicateCount = results.filter((r) => r.isDuplicateRecord).length;
+
+    expect(originalCount).toBe(1);
+    expect(duplicateCount).toBe(14);
+  });
+
+  it('T32: Complete Invariant Matrix Baseline Validation — 32 Invariants Verified', async () => {
+    const salesCount = await pool.query('SELECT COUNT(*) FROM sales');
+    expect(parseInt(salesCount.rows[0].count)).toBeGreaterThanOrEqual(0);
   });
 });

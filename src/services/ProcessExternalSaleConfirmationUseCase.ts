@@ -8,7 +8,6 @@ import { SaleRecordedDomainEvent, DomainEventNames } from '@/domain/events/Domai
 import { IdempotencyStore } from '@/platform/IdempotencyStore';
 import { OutboxStore } from '@/platform/OutboxStore';
 import { PgOutboxStore } from '@/platform/pg/PgOutboxStore';
-import { PgPool } from '@/platform/pg/PgPool';
 import { OutboxPublisherWorker } from '@/platform/OutboxPublisherWorker';
 import { bootstrapStageOpsApplication } from '@/application/Bootstrap';
 
@@ -38,12 +37,13 @@ export interface ProcessExternalSaleConfirmationResult {
 /**
  * StageOps Application Use Case: Process External Sale Confirmation.
  * 
- * Executing sequence:
- * 1. Stripe-style Idempotency Lock & Response Cache Check (24h TTL)
- * 2. Validate Venue Asset Availability & Database Transaction Locking (FOR UPDATE)
- * 3. Create Sale Aggregate & Sale Lines
- * 4. Persist Sale Aggregate, Asset Projection & OutboxMessage atomically (Transactional Outbox Pattern)
- * 5. OutboxPublisherWorker background process dispatches pending events asynchronously
+ * Production Transaction Flow (Non-Aborting SQL Pattern):
+ * 1. Command Idempotency Check (SELECT existing sale for channel + reference)
+ * 2. Atomic Asset Acquisition & Locking (INSERT/UPDATE venue_asset_projections WHERE status <> 'Sold')
+ * 3. Command Idempotency Fallback Check (If asset is already sold, check if it belongs to same external reference)
+ * 4. Atomic Sale Aggregate Persistence (INSERT INTO sales ON CONFLICT DO NOTHING RETURNING id)
+ * 5. Persist Sale Lines & OutboxMessage in SAME PostgreSQL Transaction
+ * 6. UnitOfWork commits cleanly without 23505 transaction abortion
  */
 export class ProcessExternalSaleConfirmationUseCase {
   public static async execute(cmd: ProcessExternalSaleConfirmationCommand): Promise<ProcessExternalSaleConfirmationResult> {
@@ -62,63 +62,7 @@ export class ProcessExternalSaleConfirmationUseCase {
       );
 
       if (existingSaleRes.rows.length > 0) {
-        const row = existingSaleRes.rows[0];
-        const linesRes = await client.query('SELECT * FROM sale_lines WHERE sale_id = $1', [row.id]);
-        
-        const lines = linesRes.rows.map((l) => ({
-          id: l.id,
-          saleId: row.id,
-          itemType: 'VenueAsset' as const,
-          venueAssetId: l.venue_asset_id,
-          quantity: l.quantity,
-          unitPrice: parseFloat(l.unit_price),
-          discountAmount: 0,
-          taxAmount: parseFloat(l.unit_price) * 0.2,
-          totalPrice: parseFloat(l.total_price),
-          currency: row.currency,
-          exchangeRate: 1.0,
-        }));
-
-        const existingSale: Sale = {
-          id: row.id,
-          organizationId: row.organization_id,
-          eventId: row.event_id,
-          reservationId: row.reservation_id,
-          salesChannelId: row.sales_channel_id,
-          externalReference: row.external_reference,
-          channel: { type: 'ExternalChannel', name: row.sales_channel_id, reference: row.external_reference },
-          purchaserSnapshot: {
-            fullName: row.purchaser_name || 'VIP Guest',
-            phone: row.purchaser_phone || cmd.purchaserPhone || '',
-            email: row.purchaser_email || cmd.purchaserEmail || '',
-          },
-          saleDate: row.created_at,
-          grossPrice: parseFloat(row.gross_price),
-          commissionRate: parseFloat(row.gross_price) > 0 ? parseFloat(row.commission_paid) / parseFloat(row.gross_price) : 0,
-          commissionPaid: parseFloat(row.commission_paid),
-          netRevenue: parseFloat(row.net_revenue),
-          currency: row.currency,
-          exchangeRate: 1.0,
-          exchangeRateSource: 'TCMB',
-          accountingAmount: parseFloat(row.gross_price),
-          lines,
-          revenueSplit: {
-            organizerAmount: { minorUnits: BigInt(Math.round(parseFloat(row.net_revenue) * 100)), currency: row.currency, scale: 100 },
-            platformCommission: { minorUnits: BigInt(Math.round(parseFloat(row.commission_paid) * 100)), currency: row.currency, scale: 100 },
-            gatewayFee: { minorUnits: BigInt(0), currency: row.currency, scale: 100 },
-            taxAmount: { minorUnits: BigInt(Math.round(parseFloat(row.gross_price) * 0.2 * 100)), currency: row.currency, scale: 100 },
-          },
-          status: row.status,
-          notes: 'Cached PostgreSQL sale record',
-          version: 1,
-          isArchived: false,
-          createdAt: row.created_at,
-          updatedAt: row.created_at,
-        };
-        return {
-          sale: existingSale,
-          isDuplicateRecord: true,
-        };
+        return this.reconstructDuplicateSaleResponse(client, existingSaleRes.rows[0], cmd);
       }
 
       // 2. Asset existence and status validation
@@ -127,6 +71,14 @@ export class ProcessExternalSaleConfirmationUseCase {
         throw new Error('Asset not found');
       }
       if (asset.status === 'Sold') {
+        // Fallback check: If same external reference created this sold asset in a parallel committed transaction
+        const doubleCheckCommitted = await client.query(
+          'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
+          [cmd.salesChannelId, cmd.externalSaleReference]
+        );
+        if (doubleCheckCommitted.rows.length > 0) {
+          return this.reconstructDuplicateSaleResponse(client, doubleCheckCommitted.rows[0], cmd);
+        }
         throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
       }
 
@@ -136,6 +88,38 @@ export class ProcessExternalSaleConfirmationUseCase {
         [cmd.assetId]
       );
       if (projLockRes.rows.length > 0 && projLockRes.rows[0].status === 'Sold') {
+        const checkExistingInTx = await client.query(
+          'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
+          [cmd.salesChannelId, cmd.externalSaleReference]
+        );
+        if (checkExistingInTx.rows.length > 0) {
+          return this.reconstructDuplicateSaleResponse(client, checkExistingInTx.rows[0], cmd);
+        }
+        throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
+      }
+
+      // 4. Atomic Asset Acquisition & Locking in SAME transaction
+      const lockAssetQuery = `
+        INSERT INTO venue_asset_projections (
+          asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated
+        ) VALUES ($1, $2, 'VIP', 'Sold', 'Occupied', 6, $3, 1, NOW())
+        ON CONFLICT (asset_id) DO UPDATE SET
+          status = 'Sold',
+          occupancy_state = 'Occupied',
+          version = venue_asset_projections.version + 1,
+          last_updated = NOW()
+        WHERE venue_asset_projections.status <> 'Sold';
+      `;
+      const lockRes = await client.query(lockAssetQuery, [cmd.assetId, asset.name, asset.pricing.basePrice]);
+      if (lockRes.rowCount === 0) {
+        // If asset locking failed, check if same external reference succeeded in concurrent transaction
+        const checkExistingPostLock = await client.query(
+          'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
+          [cmd.salesChannelId, cmd.externalSaleReference]
+        );
+        if (checkExistingPostLock.rows.length > 0) {
+          return this.reconstructDuplicateSaleResponse(client, checkExistingPostLock.rows[0], cmd);
+        }
         throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
       }
 
@@ -203,127 +187,81 @@ export class ProcessExternalSaleConfirmationUseCase {
         updatedAt: nowISO,
       };
 
-      try {
-        // 4. INSERT Sale aggregate into PostgreSQL (with purchaser_phone and purchaser_email)
-        const saleQuery = `
-          INSERT INTO sales (
-            id, organization_id, event_id, reservation_id, sales_channel_id,
-            external_reference, purchaser_name, purchaser_phone, purchaser_email,
-            gross_price, commission_paid, net_revenue, currency, status, created_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15);
-        `;
-        await client.query(saleQuery, [
-          sale.id,
-          sale.organizationId,
-          sale.eventId,
-          sale.reservationId,
-          sale.salesChannelId,
-          sale.externalReference,
-          sale.purchaserSnapshot?.fullName,
-          sale.purchaserSnapshot?.phone,
-          sale.purchaserSnapshot?.email,
-          sale.grossPrice,
-          sale.commissionPaid,
-          sale.netRevenue,
-          sale.currency,
-          sale.status,
-          nowISO,
-        ]);
+      // 5. Non-Aborting SQL Insertion: ON CONFLICT DO NOTHING RETURNING id
+      const saleQuery = `
+        INSERT INTO sales (
+          id, organization_id, event_id, reservation_id, sales_channel_id,
+          external_reference, purchaser_name, purchaser_phone, purchaser_email,
+          gross_price, commission_paid, net_revenue, currency, status, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        ON CONFLICT (sales_channel_id, external_reference) DO NOTHING
+        RETURNING id;
+      `;
+      const insertSaleRes = await client.query(saleQuery, [
+        sale.id,
+        sale.organizationId,
+        sale.eventId,
+        sale.reservationId,
+        sale.salesChannelId,
+        sale.externalReference,
+        sale.purchaserSnapshot?.fullName,
+        sale.purchaserSnapshot?.phone,
+        sale.purchaserSnapshot?.email,
+        sale.grossPrice,
+        sale.commissionPaid,
+        sale.netRevenue,
+        sale.currency,
+        sale.status,
+        nowISO,
+      ]);
 
-        // 5. INSERT Sale lines into PostgreSQL in SAME transaction!
-        const lineQuery = `
-          INSERT INTO sale_lines (id, sale_id, venue_asset_id, quantity, unit_price, total_price)
-          VALUES ($1, $2, $3, 1, $4, $4);
-        `;
-        await client.query(lineQuery, [lineId, sale.id, cmd.assetId, grossPrice]);
-
-        // 6. Lock venue_asset_projections status to Sold in SAME transaction with WHERE status <> 'Sold' predicate
-        const lockAssetQuery = `
-          INSERT INTO venue_asset_projections (
-            asset_id, name, category, status, occupancy_state, sale_id, reservation_id, pax_capacity, base_price, version, last_updated
-          ) VALUES ($1, $2, 'VIP', 'Sold', 'Occupied', $3, $4, 6, $5, 1, NOW())
-          ON CONFLICT (asset_id) DO UPDATE SET
-            status = 'Sold',
-            occupancy_state = 'Occupied',
-            sale_id = EXCLUDED.sale_id,
-            version = venue_asset_projections.version + 1,
-            last_updated = NOW()
-          WHERE venue_asset_projections.status <> 'Sold';
-        `;
-        const lockRes = await client.query(lockAssetQuery, [cmd.assetId, asset.name, sale.id, sale.reservationId, grossPrice]);
-        if (lockRes.rowCount === 0) {
-          throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
+      if (insertSaleRes.rows.length === 0) {
+        const fetchExisting = await client.query(
+          'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
+          [cmd.salesChannelId, cmd.externalSaleReference]
+        );
+        if (fetchExisting.rows.length > 0) {
+          return this.reconstructDuplicateSaleResponse(client, fetchExisting.rows[0], cmd);
         }
-
-        // 7. INSERT OutboxMessage into PostgreSQL in SAME transaction!
-        const event: SaleRecordedDomainEvent = {
-          eventName: DomainEventNames.SaleRecorded,
-          header: {
-            eventId: IdGenerator.generateUUIDv7(),
-            eventVersion: 1,
-            occurredAt: nowISO,
-            correlationId,
-            causationId: commandId,
-            tenantId: sale.organizationId,
-            traceId: cmd.traceId,
-            spanId: cmd.spanId,
-          },
-          saleId: sale.id,
-          eventId: sale.eventId,
-        };
-
-        await PgOutboxStore.addMessage(client, 'Sale', sale.id, event);
-
-        return {
-          sale,
-          event,
-          isDuplicateRecord: false,
-        };
-      } catch (err: any) {
-        // Explicitly catch PostgreSQL 23505 unique violation on ux_sales_external_reference
-        if (err.code === '23505' && (err.constraint === 'ux_sales_external_reference' || (err.message && err.message.includes('ux_sales_external_reference')))) {
-          const pool = PgPool.getPool();
-          const fetchExisting = await pool.query(
-            'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
-            [cmd.salesChannelId, cmd.externalSaleReference]
-          );
-          if (fetchExisting.rows.length > 0) {
-            const row = fetchExisting.rows[0];
-            const linesRes = await pool.query('SELECT * FROM sale_lines WHERE sale_id = $1', [row.id]);
-            const lines = linesRes.rows.map((l) => ({
-              id: l.id,
-              saleId: row.id,
-              itemType: 'VenueAsset' as const,
-              venueAssetId: l.venue_asset_id,
-              quantity: l.quantity,
-              unitPrice: parseFloat(l.unit_price),
-              discountAmount: 0,
-              taxAmount: parseFloat(l.unit_price) * 0.2,
-              totalPrice: parseFloat(l.total_price),
-              currency: row.currency,
-              exchangeRate: 1.0,
-            }));
-
-            return {
-              sale: {
-                ...sale,
-                id: row.id,
-                grossPrice: parseFloat(row.gross_price),
-                commissionPaid: parseFloat(row.commission_paid),
-                netRevenue: parseFloat(row.net_revenue),
-                purchaserSnapshot: {
-                  fullName: row.purchaser_name || 'VIP Guest',
-                  phone: row.purchaser_phone || cmd.purchaserPhone || '',
-                  email: row.purchaser_email || cmd.purchaserEmail || '',
-                },
-                lines,
-              },
-              isDuplicateRecord: true,
-            };
-          }
-        }
-        throw err;
       }
+
+      // 6. Update sale_id on venue_asset_projections
+      await client.query(
+        'UPDATE venue_asset_projections SET sale_id = $1, reservation_id = $2 WHERE asset_id = $3',
+        [sale.id, sale.reservationId, cmd.assetId]
+      );
+
+      // 7. INSERT Sale lines into PostgreSQL in SAME transaction
+      const lineQuery = `
+        INSERT INTO sale_lines (id, sale_id, venue_asset_id, quantity, unit_price, total_price)
+        VALUES ($1, $2, $3, 1, $4, $4);
+      `;
+      await client.query(lineQuery, [lineId, sale.id, cmd.assetId, grossPrice]);
+
+      // 8. INSERT OutboxMessage into PostgreSQL in SAME transaction
+      const event: SaleRecordedDomainEvent = {
+        eventName: DomainEventNames.SaleRecorded,
+        header: {
+          eventId: IdGenerator.generateUUIDv7(),
+          eventVersion: 1,
+          occurredAt: nowISO,
+          correlationId,
+          causationId: commandId,
+          tenantId: sale.organizationId,
+          traceId: cmd.traceId,
+          spanId: cmd.spanId,
+        },
+        saleId: sale.id,
+        eventId: sale.eventId,
+      };
+
+      await PgOutboxStore.addMessage(client, 'Sale', sale.id, event);
+
+      return {
+        sale,
+        event,
+        isDuplicateRecord: false,
+      };
     }
 
     // In-Memory Reference Execution Path
@@ -476,5 +414,68 @@ export class ProcessExternalSaleConfirmationUseCase {
       IdempotencyStore.markFailed(idempotencyKey);
       throw err;
     }
+  }
+
+  private static async reconstructDuplicateSaleResponse(
+    client: PoolClient,
+    row: any,
+    cmd: ProcessExternalSaleConfirmationCommand
+  ): Promise<ProcessExternalSaleConfirmationResult> {
+    const linesRes = await client.query('SELECT * FROM sale_lines WHERE sale_id = $1', [row.id]);
+    const lines = linesRes.rows.map((l) => ({
+      id: l.id,
+      saleId: row.id,
+      itemType: 'VenueAsset' as const,
+      venueAssetId: l.venue_asset_id,
+      quantity: l.quantity,
+      unitPrice: parseFloat(l.unit_price),
+      discountAmount: 0,
+      taxAmount: parseFloat(l.unit_price) * 0.2,
+      totalPrice: parseFloat(l.total_price),
+      currency: row.currency,
+      exchangeRate: 1.0,
+    }));
+
+    const existingSale: Sale = {
+      id: row.id,
+      organizationId: row.organization_id,
+      eventId: row.event_id,
+      reservationId: row.reservation_id,
+      salesChannelId: row.sales_channel_id,
+      externalReference: row.external_reference,
+      channel: { type: 'ExternalChannel', name: row.sales_channel_id, reference: row.external_reference },
+      purchaserSnapshot: {
+        fullName: row.purchaser_name || 'VIP Guest',
+        phone: row.purchaser_phone || cmd.purchaserPhone || '',
+        email: row.purchaser_email || cmd.purchaserEmail || '',
+      },
+      saleDate: row.created_at,
+      grossPrice: parseFloat(row.gross_price),
+      commissionRate: parseFloat(row.gross_price) > 0 ? parseFloat(row.commission_paid) / parseFloat(row.gross_price) : 0,
+      commissionPaid: parseFloat(row.commission_paid),
+      netRevenue: parseFloat(row.net_revenue),
+      currency: row.currency,
+      exchangeRate: 1.0,
+      exchangeRateSource: 'TCMB',
+      accountingAmount: parseFloat(row.gross_price),
+      lines,
+      revenueSplit: {
+        organizerAmount: { minorUnits: BigInt(Math.round(parseFloat(row.net_revenue) * 100)), currency: row.currency, scale: 100 },
+        platformCommission: { minorUnits: BigInt(Math.round(parseFloat(row.commission_paid) * 100)), currency: row.currency, scale: 100 },
+        gatewayFee: { minorUnits: BigInt(0), currency: row.currency, scale: 100 },
+        taxAmount: { minorUnits: BigInt(Math.round(parseFloat(row.gross_price) * 0.2 * 100)), currency: row.currency, scale: 100 },
+      },
+      status: row.status,
+      notes: 'Cached PostgreSQL sale record',
+      version: 1,
+      isArchived: false,
+      createdAt: row.created_at,
+      updatedAt: row.created_at,
+    };
+
+    return {
+      sale: existingSale,
+      isDuplicateRecord: true,
+    };
   }
 }
