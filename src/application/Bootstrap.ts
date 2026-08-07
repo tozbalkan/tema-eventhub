@@ -1,4 +1,5 @@
 import { InMemoryEventBus } from './EventBus';
+import { DomainEventNames } from '@/domain/events/DomainEvents';
 import { OperationsSaleRecordedHandler } from '@/operations/application/handlers/OperationsSaleRecordedHandler';
 import { AccountingSaleRecordedHandler } from '@/accounting/application/handlers/AccountingSaleRecordedHandler';
 
@@ -12,8 +13,11 @@ export function bootstrapStageOpsApplication(): void {
   if (isInitialized) return;
 
   const eventBus = InMemoryEventBus.getInstance();
-  eventBus.subscribe('SaleRecorded', OperationsSaleRecordedHandler.handle);
-  eventBus.subscribe('SaleRecorded', AccountingSaleRecordedHandler.handle);
+  eventBus.subscribe(DomainEventNames.SaleRecorded, OperationsSaleRecordedHandler.handle);
+  eventBus.subscribe(DomainEventNames.SaleRecorded, AccountingSaleRecordedHandler.handle);
 
   isInitialized = true;
 }
+
+// Auto-bootstrap at Composition Root import
+bootstrapStageOpsApplication();

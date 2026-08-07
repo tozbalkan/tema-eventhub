@@ -35,11 +35,10 @@ export class InMemoryEventBus implements EventBus {
       const eventHandlers = this.handlers.get(event.eventName);
       if (eventHandlers) {
         eventHandlers.forEach((handler) => {
-          try {
-            handler(event);
-          } catch (err) {
-            console.error(`Error in event handler for ${event.eventName}:`, err);
-          }
+          // Promise.resolve ensures async handlers rejecting promises are caught safely
+          Promise.resolve(handler(event)).catch((err) => {
+            console.error(`Error executing event handler for ${event.eventName}:`, err);
+          });
         });
       }
     });

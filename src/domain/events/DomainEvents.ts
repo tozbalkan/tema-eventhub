@@ -1,14 +1,25 @@
 import { DomainEvent, EventHeader } from '@/application/EventBus';
 
+export const DomainEventNames = {
+  SaleRecorded: 'SaleRecorded',
+  ReservationPlaced: 'ReservationPlaced',
+  ReservationConfirmed: 'ReservationConfirmed',
+  ReservationExpired: 'ReservationExpired',
+  ReservationReleased: 'ReservationReleased',
+  ReservationCancelled: 'ReservationCancelled',
+  ReservationConvertedToSale: 'ReservationConvertedToSale',
+  AdmissionRecorded: 'AdmissionRecorded',
+} as const;
+
 export interface SaleRecordedDomainEvent extends DomainEvent {
-  eventName: 'SaleRecorded';
+  eventName: typeof DomainEventNames.SaleRecorded;
   header: EventHeader;
   saleId: string;
   eventId: string;
 }
 
 export interface ReservationPlacedDomainEvent extends DomainEvent {
-  eventName: 'ReservationPlaced';
+  eventName: typeof DomainEventNames.ReservationPlaced;
   header: EventHeader;
   reservationId: string;
   eventId: string;
@@ -16,7 +27,7 @@ export interface ReservationPlacedDomainEvent extends DomainEvent {
 }
 
 export interface ReservationConfirmedDomainEvent extends DomainEvent {
-  eventName: 'ReservationConfirmed';
+  eventName: typeof DomainEventNames.ReservationConfirmed;
   header: EventHeader;
   reservationId: string;
   eventId: string;
@@ -24,28 +35,28 @@ export interface ReservationConfirmedDomainEvent extends DomainEvent {
 }
 
 export interface ReservationExpiredDomainEvent extends DomainEvent {
-  eventName: 'ReservationExpired';
+  eventName: typeof DomainEventNames.ReservationExpired;
   header: EventHeader;
   reservationId: string;
   assetId: string;
 }
 
 export interface ReservationReleasedDomainEvent extends DomainEvent {
-  eventName: 'ReservationReleased';
+  eventName: typeof DomainEventNames.ReservationReleased;
   header: EventHeader;
   reservationId: string;
   assetId: string;
 }
 
 export interface ReservationCancelledDomainEvent extends DomainEvent {
-  eventName: 'ReservationCancelled';
+  eventName: typeof DomainEventNames.ReservationCancelled;
   header: EventHeader;
   reservationId: string;
   assetId: string;
 }
 
 export interface ReservationConvertedToSaleDomainEvent extends DomainEvent {
-  eventName: 'ReservationConvertedToSale';
+  eventName: typeof DomainEventNames.ReservationConvertedToSale;
   header: EventHeader;
   reservationId: string;
   saleId: string;
@@ -53,7 +64,7 @@ export interface ReservationConvertedToSaleDomainEvent extends DomainEvent {
 }
 
 export interface AdmissionRecordedDomainEvent extends DomainEvent {
-  eventName: 'AdmissionRecorded';
+  eventName: typeof DomainEventNames.AdmissionRecorded;
   header: EventHeader;
   admissionId: string;
   saleId?: string;

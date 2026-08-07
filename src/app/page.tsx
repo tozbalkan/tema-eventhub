@@ -23,7 +23,6 @@ import { ProcessExternalSaleConfirmationUseCase } from '@/services/ProcessExtern
 import { VenueAssetProjection, VenueAssetReadModel } from '@/operations/projections/VenueAssetProjection';
 import { AdmissionPolicy, AdmissionDecision } from '@/operations/domain/services/AdmissionPolicy';
 import { MockDataStore } from '@/repositories/mock/MockRepositories';
-import { bootstrapStageOpsApplication } from '@/application/Bootstrap';
 
 import {
   pageContainer,
@@ -110,13 +109,11 @@ export default function OperationalWorkspaceDesk() {
   ]);
 
   const refreshData = () => {
-    bootstrapStageOpsApplication();
     VenueAssetProjection.initialize(VenueService.getAssets());
     setProjections([...VenueAssetProjection.getAll()]);
   };
 
   useEffect(() => {
-    bootstrapStageOpsApplication();
     refreshData();
   }, []);
 
@@ -174,10 +171,17 @@ export default function OperationalWorkspaceDesk() {
         purchaserEmail: custEmail,
       });
 
-      addTimeline(
-        `✓ SaleRecorded Event (v1) Yayınlandı: ${selectedAssetReadModel.name}`,
-        `Kanal: Biletix | Ref: ${ref} | Net Hakediş: ₺${result.sale.netRevenue.toLocaleString('tr-TR')}`
-      );
+      if (result.isDuplicateRecord) {
+        addTimeline(
+          `⚠️ Idempotency Engeli: Mükerrer Satış Bildirimi`,
+          `Ref: ${ref} sistemi koruyarak tekrar işlenmedi.`
+        );
+      } else {
+        addTimeline(
+          `✓ SaleRecorded Event (v1) Yayınlandı: ${selectedAssetReadModel.name}`,
+          `Kanal: Biletix | Ref: ${ref} | Net Hakediş: ₺${result.sale.netRevenue.toLocaleString('tr-TR')}`
+        );
+      }
 
       setIsSaleModalOpen(false);
       refreshData();

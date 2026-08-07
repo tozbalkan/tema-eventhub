@@ -4,8 +4,8 @@ import { SalesChannel } from '@/types/sales-channel';
 import { VenueService } from './VenueService';
 import { IdGenerator } from '@/platform/IdGenerator';
 import { InMemoryEventBus } from '@/application/EventBus';
-import { SaleRecordedDomainEvent } from '@/domain/events/DomainEvents';
-import { bootstrapStageOpsApplication } from '@/application/Bootstrap';
+import { SaleRecordedDomainEvent, DomainEventNames } from '@/domain/events/DomainEvents';
+import '@/application/Bootstrap'; // Ensures Composition Root is bootstrapped
 
 export interface ProcessExternalSaleConfirmationCommand {
   reservationId?: string;
@@ -21,24 +21,39 @@ export interface ProcessExternalSaleConfirmationCommand {
 
 export interface ProcessExternalSaleConfirmationResult {
   sale: Sale;
-  event: SaleRecordedDomainEvent;
+  event?: SaleRecordedDomainEvent;
+  isDuplicateRecord: boolean;
 }
 
 /**
  * StageOps Application Use Case: Process External Sale Confirmation.
  * 
  * Executing sequence:
- * 1. Validate Venue Asset Availability
- * 2. Create Sale Aggregate (with embedded ExternalConfirmation VO and PurchaserSnapshot VO)
- * 3. Save Sale Aggregate to Repository
- * 4. Publish Minimal SaleRecorded Domain Event (v1) via Application EventBus
- * 5. Operations & Accounting BC Event Handlers execute asynchronously via EventBus
+ * 1. Idempotency Check (Duplicate webhook protection via idempotencyKey or externalSaleReference)
+ * 2. Validate Venue Asset Availability
+ * 3. Create Sale Aggregate (with embedded ExternalConfirmation VO and PurchaserSnapshot VO)
+ * 4. Save Sale Aggregate to Repository
+ * 5. Publish Minimal SaleRecorded Domain Event (v1) via Application EventBus
+ * 6. Operations & Accounting BC Event Handlers execute asynchronously via EventBus
  */
 export class ProcessExternalSaleConfirmationUseCase {
   public static execute(cmd: ProcessExternalSaleConfirmationCommand): ProcessExternalSaleConfirmationResult {
-    // Ensure Application Composition Root is bootstrapped
-    bootstrapStageOpsApplication();
+    // 1. Idempotency Check: Protect against duplicate external webhook retries
+    const existingSale = MockDataStore.sales.find(
+      (s) =>
+        s.externalReference === cmd.externalSaleReference ||
+        (cmd.idempotencyKey && s.externalConfirmation?.externalReference === cmd.idempotencyKey)
+    );
 
+    if (existingSale) {
+      console.log(`[Idempotency] Duplicate sale registration prevented for ref: ${cmd.externalSaleReference}`);
+      return {
+        sale: existingSale,
+        isDuplicateRecord: true,
+      };
+    }
+
+    // 2. Validate Venue Asset Availability
     const asset = VenueService.getAssetById(cmd.assetId);
     if (!asset) throw new Error('Asset not found');
 
@@ -59,7 +74,7 @@ export class ProcessExternalSaleConfirmationUseCase {
     const commissionPaid = grossPrice * commissionRate;
     const netRevenue = grossPrice - commissionPaid;
 
-    // 1. Create Sale Aggregate Root
+    // 3. Create Sale Aggregate Root
     const saleId = IdGenerator.generateUUIDv7();
 
     const sale: Sale = {
@@ -71,7 +86,7 @@ export class ProcessExternalSaleConfirmationUseCase {
       externalReference: cmd.externalSaleReference,
       externalConfirmation: {
         salesChannelId: cmd.salesChannelId,
-        externalReference: cmd.externalSaleReference,
+        externalReference: cmd.idempotencyKey || cmd.externalSaleReference,
         confirmedAt: nowISO,
       },
       channel: {
@@ -123,7 +138,7 @@ export class ProcessExternalSaleConfirmationUseCase {
     };
     MockDataStore.sales.push(sale);
 
-    // 2. Convert Reservation status if linked
+    // 4. Convert Reservation status if linked
     if (cmd.reservationId) {
       const res = MockDataStore.reservations.find((r) => r.id === cmd.reservationId);
       if (res) {
@@ -132,9 +147,9 @@ export class ProcessExternalSaleConfirmationUseCase {
       }
     }
 
-    // 3. Publish Minimal SaleRecorded Domain Event (v1) via Application EventBus
+    // 5. Publish Minimal SaleRecorded Domain Event (v1) via Application EventBus
     const event: SaleRecordedDomainEvent = {
-      eventName: 'SaleRecorded',
+      eventName: DomainEventNames.SaleRecorded,
       header: {
         eventId: IdGenerator.generateUUIDv7(),
         eventVersion: 1,
@@ -149,6 +164,7 @@ export class ProcessExternalSaleConfirmationUseCase {
     return {
       sale,
       event,
+      isDuplicateRecord: false,
     };
   }
 }
