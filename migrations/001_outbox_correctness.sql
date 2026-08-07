@@ -49,11 +49,14 @@ CREATE TABLE IF NOT EXISTS sales (
   created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Command Idempotency Unique Index (Prevents duplicate Sale creation for same channel + reference)
+CREATE UNIQUE INDEX IF NOT EXISTS ux_sales_external_reference ON sales (sales_channel_id, external_reference);
+
 -- Sale Lines Table (Aggregate Line Items)
 CREATE TABLE IF NOT EXISTS sale_lines (
   id                UUID PRIMARY KEY,
   sale_id           UUID NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
-  venue_asset_id    VARCHAR(100),
+  venue_asset_id    VARCHAR(100) NOT NULL,
   quantity          INT NOT NULL DEFAULT 1,
   unit_price        NUMERIC(15,2) NOT NULL,
   total_price       NUMERIC(15,2) NOT NULL
@@ -75,6 +78,9 @@ CREATE TABLE IF NOT EXISTS accounting_entries (
   occurred_at       TIMESTAMPTZ NOT NULL,
   created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Defense in depth: Unique constraint on accounting entry business keys
+CREATE UNIQUE INDEX IF NOT EXISTS ux_accounting_source_entry ON accounting_entries (organization_id, event_id, source_type, source_id, entry_type);
 
 -- Operations Projections (Business Mutation)
 CREATE TABLE IF NOT EXISTS venue_asset_projections (
