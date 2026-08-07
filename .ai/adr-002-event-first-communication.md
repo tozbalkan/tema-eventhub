@@ -34,7 +34,7 @@ Inter-Bounded Context state-mutating communication MUST occur exclusively throug
      [Domain Event]  (Minimal Past-Tense Fact with eventVersion)
             │
             ▼
-       [EventBus]    (In-Process Application Dispatcher)
+       [EventBus]    (Logical Asynchronous In-Process Dispatcher)
             │
             ▼
  [BC Event Handler]  (Operations, Accounting, Notification)
@@ -45,13 +45,22 @@ Inter-Bounded Context state-mutating communication MUST occur exclusively throug
 
 ---
 
-## 3. In-Process Dispatcher vs Cross-Process Broker (Outbox Note)
+## 3. Logical Asynchronous Decoupling & In-Process Dispatcher Note
 
-> **Architectural Note**: `EventBus` is an in-process memory dispatcher used within the StageOps deployment boundary. Cross-process delivery to external message brokers (e.g. RabbitMQ, Kafka, Azure Service Bus) is achieved through the **Transactional Outbox Pattern** via `OutboxPublisher`.
+> **Architectural Note**: `EventBus` provides **logical asynchronous decoupling** within the application boundary. In the v1 baseline, `InMemoryEventBus` executes handlers within the same thread execution cycle while completely decoupling domain dependencies. Cross-process delivery to external message brokers (e.g. RabbitMQ, Kafka, Azure Service Bus) is achieved through the **Transactional Outbox Pattern** via `OutboxPublisher`.
 
 ---
 
-## 4. CQRS Read-Only Query Exception
+## 4. Event Ordering Guarantee & Idempotency Rules
+
+1. **Stream Ordering Guarantee**:
+   - Event ordering guarantees exist **strictly within the same aggregate stream** (`saleId` or `reservationId`). Cross-aggregate event ordering is non-deterministic by design.
+2. **Idempotency Key Protection**:
+   - External sale registration commands carry an optional `idempotencyKey` (e.g., webhook reference ID) to prevent duplicate event publishing from external partner retries (Biletix, Passo).
+
+---
+
+## 5. CQRS Read-Only Query Exception
 
 > **State-mutating operations MUST strictly follow Event-First communication. Read-only (query-only) operations may use synchronous, defined Query APIs or Read Model queries.**
 
@@ -61,7 +70,7 @@ Examples of allowed Read-Only Queries:
 
 ---
 
-## 5. Strict Architectural Rules for Developers
+## 6. Strict Architectural Rules for Developers
 
 1. **Forbidden Direct Mutating Invocations**:
    - `Sale Bounded Context` MUST NEVER call `AccountingService` or `VenueService` state-changing methods directly inside a Use Case.
@@ -76,7 +85,7 @@ Examples of allowed Read-Only Queries:
 
 ---
 
-## 6. Consequences & Benefits
+## 7. Consequences & Benefits
 
 - **Zero Cascading Failures**: A failure in Accounting or Reporting handlers will never break the primary Sale registration transaction.
 - **Microservices Ready**: Moving a Bounded Context (e.g. Accounting or Operations) out into an independent microservice requires zero changes to the `Sale` domain logic—only swapping the `InMemoryEventBus` for a message broker (`RabbitMQ` / `Kafka`).

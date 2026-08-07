@@ -23,6 +23,7 @@ import { ProcessExternalSaleConfirmationUseCase } from '@/services/ProcessExtern
 import { VenueAssetProjection, VenueAssetReadModel } from '@/operations/projections/VenueAssetProjection';
 import { AdmissionPolicy, AdmissionDecision } from '@/operations/domain/services/AdmissionPolicy';
 import { MockDataStore } from '@/repositories/mock/MockRepositories';
+import { bootstrapStageOpsApplication } from '@/application/Bootstrap';
 
 import {
   pageContainer,
@@ -70,7 +71,6 @@ import {
   modalTicketTokenBox,
   textBold,
   modalTokenCode,
-  modalTextError,
 } from './page.css';
 
 interface TimelineLog {
@@ -110,11 +110,13 @@ export default function OperationalWorkspaceDesk() {
   ]);
 
   const refreshData = () => {
+    bootstrapStageOpsApplication();
     VenueAssetProjection.initialize(VenueService.getAssets());
     setProjections([...VenueAssetProjection.getAll()]);
   };
 
   useEffect(() => {
+    bootstrapStageOpsApplication();
     refreshData();
   }, []);
 
@@ -210,6 +212,7 @@ export default function OperationalWorkspaceDesk() {
         organizationId: MockDataStore.organizationId,
         eventId: MockDataStore.event.id,
         venueAssetId: selectedAssetReadModel.assetId,
+        saleId: selectedAssetReadModel.saleId,
         gateId: MockDataStore.gates[0]?.id || 'gate_vip_north',
         guestName: custName,
         checkedInAt: new Date().toISOString(),

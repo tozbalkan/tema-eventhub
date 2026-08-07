@@ -5,8 +5,7 @@ import { VenueService } from './VenueService';
 import { IdGenerator } from '@/platform/IdGenerator';
 import { InMemoryEventBus } from '@/application/EventBus';
 import { SaleRecordedDomainEvent } from '@/domain/events/DomainEvents';
-import { OperationsSaleRecordedHandler } from '@/operations/application/handlers/OperationsSaleRecordedHandler';
-import { AccountingSaleRecordedHandler } from '@/accounting/application/handlers/AccountingSaleRecordedHandler';
+import { bootstrapStageOpsApplication } from '@/application/Bootstrap';
 
 export interface ProcessExternalSaleConfirmationCommand {
   reservationId?: string;
@@ -25,16 +24,6 @@ export interface ProcessExternalSaleConfirmationResult {
   event: SaleRecordedDomainEvent;
 }
 
-// Subscribe Bounded Context Event Handlers once
-let isSubscribed = false;
-function setupEventSubscriptions() {
-  if (isSubscribed) return;
-  const eventBus = InMemoryEventBus.getInstance();
-  eventBus.subscribe('SaleRecorded', OperationsSaleRecordedHandler.handle);
-  eventBus.subscribe('SaleRecorded', AccountingSaleRecordedHandler.handle);
-  isSubscribed = true;
-}
-
 /**
  * StageOps Application Use Case: Process External Sale Confirmation.
  * 
@@ -47,7 +36,8 @@ function setupEventSubscriptions() {
  */
 export class ProcessExternalSaleConfirmationUseCase {
   public static execute(cmd: ProcessExternalSaleConfirmationCommand): ProcessExternalSaleConfirmationResult {
-    setupEventSubscriptions();
+    // Ensure Application Composition Root is bootstrapped
+    bootstrapStageOpsApplication();
 
     const asset = VenueService.getAssetById(cmd.assetId);
     if (!asset) throw new Error('Asset not found');
