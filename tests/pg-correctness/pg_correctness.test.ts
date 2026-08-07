@@ -916,23 +916,30 @@ describe('PostgreSQL Correctness Baseline (T1 - T34 Integration Tests)', () => {
     expect(duplicateCount).toBe(14);
   });
 
-  it('T32: Database Consistent Schema Sanity Verification', async () => {
-    const salesRes = await pool.query('SELECT COUNT(*) FROM sales');
-    const outboxRes = await pool.query('SELECT COUNT(*) FROM outbox_messages');
-    expect(parseInt(salesRes.rows[0].count)).toBeGreaterThanOrEqual(0);
-    expect(parseInt(outboxRes.rows[0].count)).toBeGreaterThanOrEqual(0);
+  it('T32: Basic Database Accessibility & Schema Structure Sanity Check', async () => {
+    const requiredTables = ['sales', 'sale_lines', 'outbox_messages', 'venue_asset_projections', 'accounting_entries', 'processed_events'];
+    const tablesRes = await pool.query(
+      `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name = ANY($1)`,
+      [requiredTables]
+    );
+
+    const foundTables = tablesRes.rows.map((r) => r.table_name);
+    expect(foundTables.length).toBe(requiredTables.length);
+
+    const indexRes = await pool.query(`SELECT indexname FROM pg_indexes WHERE indexname = 'ux_accounting_source_entry'`);
+    expect(indexRes.rows.length).toBe(1);
   });
 
   it('T33: Same External Reference + Different Assets Phantom Protection', async () => {
     const ref = 'BTX-PHANTOM-REF-001';
     const winningAssetId = 'asset_vip_a4';
-    const losingAssetId = 'asset_bistro_b1';
+    const losingAssetId = 'asset_vip_a2';
 
     await pool.query(
       `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
        VALUES 
         ($1, 'VIP Asset A4', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW()),
-        ($2, 'Bistro B1', 'Bistro', 'Available', 'Vacant', 4, 12000, 1, NOW());`,
+        ($2, 'VIP Asset A2', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW());`,
       [winningAssetId, losingAssetId]
     );
 
@@ -966,46 +973,61 @@ describe('PostgreSQL Correctness Baseline (T1 - T34 Integration Tests)', () => {
     const dbSales = await pool.query('SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2', ['biletix', ref]);
     expect(dbSales.rows.length).toBe(1);
 
-    const losingProj = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', [losingAssetId]);
-    expect(losingProj.rows[0].status).toBe('Available');
+    const projA = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', [winningAssetId]);
+    const projB = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', [losingAssetId]);
+
+    const soldCount = [projA.rows[0]?.status, projB.rows[0]?.status].filter((s) => s === 'Sold').length;
+    const availableCount = [projA.rows[0]?.status, projB.rows[0]?.status].filter((s) => s === 'Available').length;
+
+    expect(soldCount).toBe(1);
+    expect(availableCount).toBe(1);
   });
 
-  it('T34: Multi-Asset Deterministic Lock Ordering — Cross-lock deadlock hazard prevention in the reservation path', async () => {
-    const asset1 = 'asset_vip_a2';
-    const asset2 = 'asset_vip_a3';
+  it('T34: REAL Multi-Asset Cross-Lock Ordering & Deadlock Prevention Invariant', async () => {
+    const assetA = 'asset_vip_a2';
+    const assetB = 'asset_vip_a3';
 
     await pool.query(
       `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
        VALUES 
         ($1, 'VIP A2', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW()),
         ($2, 'VIP A3', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW());`,
-      [asset1, asset2]
+      [assetA, assetB]
     );
 
-    const taskA = UnitOfWork.execute((tx) =>
+    // Worker 1 requests [assetB, assetA] (unsorted order)
+    const task1 = UnitOfWork.execute((tx) =>
       ProcessExternalSaleConfirmationUseCase.execute({
         eventId: 'event_gala_2026',
-        assetId: asset1,
+        assetIds: [assetB, assetA],
         salesChannelId: 'biletix',
-        externalSaleReference: 'BTX-DEADLOCK-TEST-A',
+        externalSaleReference: 'BTX-MULTI-UNSORTED-1',
         pgClient: tx,
       })
-    ).catch((err) => ({ error: err.message }));
+    ).catch((err: Error) => ({ error: err.message }));
 
-    const taskB = UnitOfWork.execute((tx) =>
+    // Worker 2 requests [assetA, assetB] (opposite unsorted order)
+    const task2 = UnitOfWork.execute((tx) =>
       ProcessExternalSaleConfirmationUseCase.execute({
         eventId: 'event_gala_2026',
-        assetId: asset2,
+        assetIds: [assetA, assetB],
         salesChannelId: 'passo',
-        externalSaleReference: 'PASSO-DEADLOCK-TEST-B',
+        externalSaleReference: 'PASSO-MULTI-UNSORTED-2',
         pgClient: tx,
       })
-    ).catch((err) => ({ error: err.message }));
+    ).catch((err: Error) => ({ error: err.message }));
 
-    const results = await Promise.all([taskA, taskB]);
+    const results = await Promise.all([task1, task2]);
     const errors = results.filter((r) => 'error' in r).map((r: any) => r.error);
 
+    // 1. Verify ZERO PostgreSQL "deadlock detected" error occurred!
     const hasDeadlockError = errors.some((e) => e.toLowerCase().includes('deadlock'));
     expect(hasDeadlockError).toBe(false);
+
+    // 2. Verify exactly 1 transaction won both seats and 1 transaction was cleanly rejected with SEAT_ALREADY_RESERVED
+    const successfulSales = results.filter((r) => 'sale' in r);
+    expect(successfulSales.length).toBe(1);
+    expect(errors.length).toBe(1);
+    expect(errors[0]).toContain('SEAT_ALREADY_RESERVED');
   });
 });

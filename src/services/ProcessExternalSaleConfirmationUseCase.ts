@@ -15,7 +15,8 @@ export interface ProcessExternalSaleConfirmationCommand {
   commandId?: string;
   reservationId?: string;
   eventId: string;
-  assetId: string;
+  assetId?: string;
+  assetIds?: string[]; // Supports single or multi-asset reservations
   salesChannelId: string; // e.g. "biletix", "passo", "desk", "corporate"
   externalSaleReference: string; // e.g. "BTX-20260807-18291"
   purchaserName?: string;
@@ -37,13 +38,13 @@ export interface ProcessExternalSaleConfirmationResult {
 /**
  * StageOps Application Use Case: Process External Sale Confirmation.
  * 
- * Production Transaction Flow (Deadlock-Free Non-Aborting Pattern):
+ * Production Transaction Flow (Multi-Asset Deterministic Deadlock-Free Pattern):
  * 1. Command Idempotency Check (SELECT existing sale for channel + reference)
- * 2. Asset existence & status pre-validation
+ * 2. Asset existence & status pre-validation for all assets
  * 3. Reserve Sale Ownership FIRST (INSERT INTO sales ON CONFLICT DO NOTHING RETURNING id)
  *    - If duplicate detected: Return existing sale payload WITHOUT mutating asset projections (Zero Phantom Side-Effects!)
- * 4. Deterministic Asset ID Lock Ordering (assetIds.sort()) & Acquisition ONLY IF sale ownership was won!
- *    - If asset is already sold: Throw SEAT_ALREADY_RESERVED (triggers UnitOfWork ROLLBACK of step 3 sale insert)
+ * 4. Deterministic Asset Lock Ordering ((assetIds || [assetId]).sort()) & Acquisition ONLY IF sale ownership was won!
+ *    - If any asset is already sold: Throw SEAT_ALREADY_RESERVED (triggers UnitOfWork ROLLBACK of step 3 sale insert)
  * 5. Persist Sale Lines & OutboxMessage in SAME PostgreSQL Transaction
  * 6. UnitOfWork commits cleanly without 23505 transaction abortion or deadlock hazards
  */
@@ -52,6 +53,7 @@ export class ProcessExternalSaleConfirmationUseCase {
     bootstrapStageOpsApplication();
 
     const idempotencyKey = cmd.idempotencyKey || cmd.externalSaleReference;
+    const requestedAssetIds = cmd.assetIds && cmd.assetIds.length > 0 ? cmd.assetIds : [cmd.assetId || ''];
 
     // PostgreSQL Transactional Execution Path
     if (cmd.pgClient) {
@@ -67,23 +69,27 @@ export class ProcessExternalSaleConfirmationUseCase {
         return this.reconstructDuplicateSaleResponse(client, existingSaleRes.rows[0], cmd);
       }
 
-      // 2. Asset existence and status validation
-      const asset = VenueService.getAssetById(cmd.assetId);
-      if (!asset) {
-        throw new Error('Asset not found');
-      }
-      if (asset.status === 'Sold') {
-        const doubleCheckCommitted = await client.query(
-          'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
-          [cmd.salesChannelId, cmd.externalSaleReference]
-        );
-        if (doubleCheckCommitted.rows.length > 0) {
-          return this.reconstructDuplicateSaleResponse(client, doubleCheckCommitted.rows[0], cmd);
+      // 2. Asset existence and status pre-validation for all requested assets
+      for (const currentAssetId of requestedAssetIds) {
+        const asset = VenueService.getAssetById(currentAssetId);
+        if (!asset) {
+          throw new Error(`Asset not found: ${currentAssetId}`);
         }
-        throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
+        if (asset.status === 'Sold') {
+          const doubleCheckCommitted = await client.query(
+            'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
+            [cmd.salesChannelId, cmd.externalSaleReference]
+          );
+          if (doubleCheckCommitted.rows.length > 0) {
+            return this.reconstructDuplicateSaleResponse(client, doubleCheckCommitted.rows[0], cmd);
+          }
+          throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
+        }
       }
 
-      const grossPrice = asset.pricing.basePrice;
+      const primaryAsset = VenueService.getAssetById(requestedAssetIds[0]!)!;
+      const unitPrice = primaryAsset.pricing.basePrice;
+      const grossPrice = unitPrice * requestedAssetIds.length;
       const defaultChannel: SalesChannel = { id: 'desk', name: 'Organizasyon Masası', commissionPercentage: 0.0, isArchived: false };
       const channel = MockDataStore.salesChannels.find((c) => c.id === cmd.salesChannelId) ?? defaultChannel;
       const commissionRate = channel.commissionPercentage / 100;
@@ -94,7 +100,20 @@ export class ProcessExternalSaleConfirmationUseCase {
       const commandId = cmd.commandId || IdGenerator.generateUUIDv7();
       const correlationId = cmd.correlationId || IdGenerator.generateUUIDv7();
       const saleId = IdGenerator.generateUUIDv7();
-      const lineId = IdGenerator.generateUUIDv7();
+
+      const lines = requestedAssetIds.map((aId) => ({
+        id: IdGenerator.generateUUIDv7(),
+        saleId,
+        itemType: 'VenueAsset' as const,
+        venueAssetId: aId,
+        quantity: 1,
+        unitPrice,
+        discountAmount: 0,
+        taxAmount: unitPrice * 0.2,
+        totalPrice: unitPrice,
+        currency: primaryAsset.pricing.currency,
+        exchangeRate: 1.0,
+      }));
 
       const sale: Sale = {
         id: saleId,
@@ -114,30 +133,16 @@ export class ProcessExternalSaleConfirmationUseCase {
         commissionRate,
         commissionPaid,
         netRevenue,
-        currency: asset.pricing.currency,
+        currency: primaryAsset.pricing.currency,
         exchangeRate: 1.0,
         exchangeRateSource: 'TCMB',
         accountingAmount: grossPrice,
-        lines: [
-          {
-            id: lineId,
-            saleId,
-            itemType: 'VenueAsset',
-            venueAssetId: cmd.assetId,
-            quantity: 1,
-            unitPrice: grossPrice,
-            discountAmount: 0,
-            taxAmount: grossPrice * 0.2,
-            totalPrice: grossPrice,
-            currency: asset.pricing.currency,
-            exchangeRate: 1.0,
-          },
-        ],
+        lines,
         revenueSplit: {
-          organizerAmount: { minorUnits: BigInt(Math.round(netRevenue * 100)), currency: asset.pricing.currency, scale: 100 },
-          platformCommission: { minorUnits: BigInt(Math.round(commissionPaid * 100)), currency: asset.pricing.currency, scale: 100 },
-          gatewayFee: { minorUnits: BigInt(0), currency: asset.pricing.currency, scale: 100 },
-          taxAmount: { minorUnits: BigInt(Math.round(grossPrice * 0.2 * 100)), currency: asset.pricing.currency, scale: 100 },
+          organizerAmount: { minorUnits: BigInt(Math.round(netRevenue * 100)), currency: primaryAsset.pricing.currency, scale: 100 },
+          platformCommission: { minorUnits: BigInt(Math.round(commissionPaid * 100)), currency: primaryAsset.pricing.currency, scale: 100 },
+          gatewayFee: { minorUnits: BigInt(0), currency: primaryAsset.pricing.currency, scale: 100 },
+          taxAmount: { minorUnits: BigInt(Math.round(grossPrice * 0.2 * 100)), currency: primaryAsset.pricing.currency, scale: 100 },
         },
         status: 'Completed',
         notes: 'PostgreSQL sale record',
@@ -185,9 +190,10 @@ export class ProcessExternalSaleConfirmationUseCase {
         }
       }
 
-      // 4. Deterministic Asset Lock Ordering (Sorted asset IDs prevent deadlocks!)
-      const targetAssetIds = [cmd.assetId].sort();
-      for (const assetIdToLock of targetAssetIds) {
+      // 4. REAL Multi-Asset Deterministic Lock Ordering: Sort asset IDs deterministically BEFORE acquiring locks!
+      const sortedAssetIds = [...requestedAssetIds].sort();
+      for (const assetIdToLock of sortedAssetIds) {
+        const assetObj = VenueService.getAssetById(assetIdToLock);
         const lockAssetQuery = `
           INSERT INTO venue_asset_projections (
             asset_id, name, category, status, occupancy_state, sale_id, reservation_id, pax_capacity, base_price, version, last_updated
@@ -200,18 +206,26 @@ export class ProcessExternalSaleConfirmationUseCase {
             last_updated = NOW()
           WHERE venue_asset_projections.status <> 'Sold';
         `;
-        const lockRes = await client.query(lockAssetQuery, [assetIdToLock, asset.name, sale.id, sale.reservationId, grossPrice]);
+        const lockRes = await client.query(lockAssetQuery, [
+          assetIdToLock,
+          assetObj?.name || 'Venue Asset',
+          sale.id,
+          sale.reservationId,
+          assetObj?.pricing?.basePrice || unitPrice,
+        ]);
         if (lockRes.rowCount === 0) {
           throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
         }
       }
 
       // 5. INSERT Sale lines into PostgreSQL in SAME transaction
-      const lineQuery = `
-        INSERT INTO sale_lines (id, sale_id, venue_asset_id, quantity, unit_price, total_price)
-        VALUES ($1, $2, $3, 1, $4, $4);
-      `;
-      await client.query(lineQuery, [lineId, sale.id, cmd.assetId, grossPrice]);
+      for (const line of sale.lines) {
+        const lineQuery = `
+          INSERT INTO sale_lines (id, sale_id, venue_asset_id, quantity, unit_price, total_price)
+          VALUES ($1, $2, $3, 1, $4, $4);
+        `;
+        await client.query(lineQuery, [line.id, sale.id, line.venueAssetId, line.unitPrice]);
+      }
 
       // 6. INSERT OutboxMessage into PostgreSQL in SAME transaction
       const event: SaleRecordedDomainEvent = {
@@ -259,7 +273,8 @@ export class ProcessExternalSaleConfirmationUseCase {
     }
 
     try {
-      const asset = VenueService.getAssetById(cmd.assetId);
+      const primaryAssetId = requestedAssetIds[0]!;
+      const asset = VenueService.getAssetById(primaryAssetId);
       if (!asset) {
         IdempotencyStore.markFailed(idempotencyKey);
         throw new Error('Asset not found');
@@ -323,7 +338,7 @@ export class ProcessExternalSaleConfirmationUseCase {
             id: IdGenerator.generateUUIDv7(),
             saleId,
             itemType: 'VenueAsset',
-            venueAssetId: cmd.assetId,
+            venueAssetId: primaryAssetId,
             quantity: 1,
             unitPrice: grossPrice,
             discountAmount: 0,
