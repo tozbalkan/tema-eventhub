@@ -19,6 +19,16 @@ export interface DomainEvent {
 
 export type EventHandler<T extends DomainEvent = DomainEvent> = (event: Readonly<T>) => void | Promise<void>;
 
+/**
+ * EventBus interface.
+ * 
+ * publish() semantics: Dispatches event to all registered local handlers.
+ * "Published" in Outbox context means "event successfully dispatched to local handlers"
+ * (in-process mode) or "event accepted by message broker" (distributed mode).
+ * 
+ * Consumer success/failure is a separate lifecycle — consumers are responsible
+ * for their own idempotency via ConsumerIdempotencyStore.
+ */
 export interface EventBus {
   publish(event: DomainEvent): Promise<void>;
   publish(events: readonly DomainEvent[]): Promise<void>;
@@ -44,23 +54,36 @@ export class InMemoryEventBus implements EventBus {
     for (const event of events) {
       const eventHandlers = this.handlers.get(event.eventName);
       if (eventHandlers) {
-        // Apply deepFreeze to guarantee 100% deep immutability across all nested event properties
+        // Apply deepFreeze: JSON-serializable payloads only (no Date/Map/Set/Buffer)
         const immutableEvent = deepFreeze(event);
+        const handlerEntries = Array.from(eventHandlers);
         const results = await Promise.allSettled(
-          Array.from(eventHandlers).map((handler) => Promise.resolve(handler(immutableEvent)))
+          handlerEntries.map((handler) => Promise.resolve(handler(immutableEvent)))
         );
 
-        const rejected = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
-        if (rejected.length > 0) {
-          const firstError = rejected[0]?.reason;
-          this.logger.error(`Failed to publish event ${event.eventName} due to ${rejected.length} handler errors`, firstError, {
-            eventId: event.header.eventId,
-            correlationId: event.header.correlationId,
-            causationId: event.header.causationId,
-            tenantId: event.header.tenantId,
-          });
-          // Re-throw so OutboxPublisherWorker marks message as Failed for exponential backoff
-          throw firstError instanceof Error ? firstError : new Error(String(firstError));
+        const failures: { index: number; reason: any }[] = [];
+        results.forEach((result, index) => {
+          if (result.status === 'rejected') {
+            failures.push({ index, reason: result.reason });
+          }
+        });
+
+        if (failures.length > 0) {
+          this.logger.error(
+            `Event ${event.eventName} dispatch completed with ${failures.length}/${handlerEntries.length} handler failures`,
+            failures[0]?.reason,
+            {
+              eventId: event.header.eventId,
+              correlationId: event.header.correlationId,
+              causationId: event.header.causationId,
+              tenantId: event.header.tenantId,
+              failedHandlerCount: failures.length,
+              totalHandlerCount: handlerEntries.length,
+            }
+          );
+          // Re-throw so OutboxPublisherWorker marks message as Failed for retry/backoff
+          const firstErr = failures[0]?.reason;
+          throw firstErr instanceof Error ? firstErr : new Error(String(firstErr));
         }
       }
     }

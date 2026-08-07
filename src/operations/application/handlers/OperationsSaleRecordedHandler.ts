@@ -3,9 +3,17 @@ import { VenueAssetProjection } from '../../projections/VenueAssetProjection';
 import { AdmissionRightsProjection } from '../../projections/AdmissionRightsProjection';
 import { VenueService } from '@/services/VenueService';
 import { MockDataStore } from '@/repositories/mock/MockRepositories';
+import { ConsumerIdempotencyStore } from '@/platform/ConsumerIdempotencyStore';
+
+const CONSUMER_NAME = 'OperationsSaleRecordedHandler';
 
 export class OperationsSaleRecordedHandler {
   public static handle(event: SaleRecordedDomainEvent): void {
+    // Consumer Idempotency: skip if this event was already processed by this handler
+    if (ConsumerIdempotencyStore.isAlreadyProcessed(event.header.eventId, CONSUMER_NAME)) {
+      return;
+    }
+
     const sale = MockDataStore.sales.find((s) => s.id === event.saleId);
     if (!sale) return;
 
@@ -31,5 +39,8 @@ export class OperationsSaleRecordedHandler {
         maxCapacityPax: asset?.paxCapacity || 6,
       });
     });
+
+    // Mark as processed — future retries will be safely skipped
+    ConsumerIdempotencyStore.markProcessed(event.header.eventId, CONSUMER_NAME);
   }
 }

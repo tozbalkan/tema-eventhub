@@ -1,4 +1,5 @@
 import { DomainEvent } from '@/application/EventBus';
+import { IdGenerator } from './IdGenerator';
 
 export type OutboxStatus = 'Pending' | 'Claimed' | 'Published' | 'Failed' | 'DeadLetter';
 
@@ -20,11 +21,19 @@ export interface OutboxMessage {
 }
 
 /**
- * Transactional Outbox Store with Atomic Worker Leasing & Dead-Letter Queue (DLQ).
+ * Transactional Outbox Store — In-Memory Reference Implementation.
  * 
- * Guarantees 100% Atomicity between Aggregate Persistence and Event Publishing.
- * Supports multi-worker leasing locks (claimPendingMessages) to prevent duplicate dispatching
- * in scaled-out container environments (Kubernetes pods).
+ * IMPORTANT ARCHITECTURAL NOTE:
+ * This is an in-memory reference implementation of the Transactional Outbox pattern.
+ * In production, Sale INSERT and OutboxMessage INSERT MUST occur within a single
+ * database transaction (BEGIN → INSERT Sale → INSERT OutboxMessage → COMMIT).
+ * The current in-memory arrays do NOT provide real transactional atomicity.
+ * 
+ * Distributed leasing contract defined; persistence-backed implementation
+ * (PostgreSQL SELECT ... FOR UPDATE SKIP LOCKED) pending.
+ * 
+ * Published semantics: "Event successfully dispatched to local in-process handlers"
+ * (current mode). In distributed mode: "Event accepted by message broker (RabbitMQ ACK / Kafka leader commit)".
  */
 export class OutboxStore {
   private static messages: OutboxMessage[] = [];
@@ -51,8 +60,8 @@ export class OutboxStore {
   }
 
   /**
-   * Atomic Lease Locking: Claims pending messages for a specific worker instance
-   * preventing race conditions across multiple OutboxPublisherWorker processes.
+   * In-process lease claiming. In production: SELECT ... FOR UPDATE SKIP LOCKED.
+   * Multi-worker leasing contract implemented; distributed persistence adapter pending.
    */
   public static claimPendingMessages(workerId: string, batchSize = 10, leaseDurationMs = 30000): OutboxMessage[] {
     const now = new Date();
@@ -102,9 +111,10 @@ export class OutboxStore {
       console.error(`[Outbox DLQ] Message ${messageId} moved to Dead Letter Queue after ${msg.retryCount} retries.`);
     } else {
       msg.status = 'Failed';
-      // Exponential Backoff
-      const backoffMs = Math.pow(2, msg.retryCount) * 1000;
-      msg.nextRetryAt = new Date(Date.now() + backoffMs).toISOString();
+      // Exponential Backoff + Jitter to prevent thundering herd across workers
+      const base = Math.pow(2, msg.retryCount) * 1000;
+      const jitter = Math.floor(Math.random() * base * 0.25);
+      msg.nextRetryAt = new Date(Date.now() + base + jitter).toISOString();
     }
   }
 

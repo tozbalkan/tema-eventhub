@@ -2,9 +2,17 @@ import { SaleRecordedDomainEvent } from '@/domain/events/DomainEvents';
 import { AccountingEntry } from '@/types/accounting-entry';
 import { MockDataStore } from '@/repositories/mock/MockRepositories';
 import { IdGenerator } from '@/platform/IdGenerator';
+import { ConsumerIdempotencyStore } from '@/platform/ConsumerIdempotencyStore';
+
+const CONSUMER_NAME = 'AccountingSaleRecordedHandler';
 
 export class AccountingSaleRecordedHandler {
   public static handle(event: SaleRecordedDomainEvent): void {
+    // Consumer Idempotency: skip if this event was already processed by this handler
+    if (ConsumerIdempotencyStore.isAlreadyProcessed(event.header.eventId, CONSUMER_NAME)) {
+      return;
+    }
+
     const sale = MockDataStore.sales.find((s) => s.id === event.saleId);
     if (!sale) return;
 
@@ -37,5 +45,8 @@ export class AccountingSaleRecordedHandler {
     };
 
     MockDataStore.accountingEntries.push(accRevenue, accCommission);
+
+    // Mark as processed — future retries will be safely skipped
+    ConsumerIdempotencyStore.markProcessed(event.header.eventId, CONSUMER_NAME);
   }
 }
