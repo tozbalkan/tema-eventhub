@@ -970,7 +970,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T34 Integration Tests)', () => {
     expect(losingProj.rows[0].status).toBe('Available');
   });
 
-  it('T34: Multi-Asset Deterministic Lock Ordering & Deadlock Prevention Invariant', async () => {
+  it('T34: Multi-Asset Deterministic Lock Ordering — Cross-lock deadlock hazard prevention in the reservation path', async () => {
     const asset1 = 'asset_vip_a2';
     const asset2 = 'asset_vip_a3';
 
@@ -982,7 +982,6 @@ describe('PostgreSQL Correctness Baseline (T1 - T34 Integration Tests)', () => {
       [asset1, asset2]
     );
 
-    // Worker A requests asset1, Worker B requests asset2 concurrently
     const taskA = UnitOfWork.execute((tx) =>
       ProcessExternalSaleConfirmationUseCase.execute({
         eventId: 'event_gala_2026',
@@ -1006,7 +1005,6 @@ describe('PostgreSQL Correctness Baseline (T1 - T34 Integration Tests)', () => {
     const results = await Promise.all([taskA, taskB]);
     const errors = results.filter((r) => 'error' in r).map((r: any) => r.error);
 
-    // Verify zero PostgreSQL "deadlock detected" error occurred!
     const hasDeadlockError = errors.some((e) => e.toLowerCase().includes('deadlock'));
     expect(hasDeadlockError).toBe(false);
   });
