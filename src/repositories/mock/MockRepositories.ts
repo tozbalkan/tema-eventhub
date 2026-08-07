@@ -347,13 +347,22 @@ export class MockDataStore {
       id: 'sale_a1_01',
       organizationId: MockDataStore.organizationId,
       eventId: MockDataStore.event.id,
-      customerId: 'cust_tarik_01',
       salesChannelId: 'biletix',
       externalReference: 'BTX-20260807-18291',
       externalConfirmation: {
         salesChannelId: 'biletix',
         externalReference: 'BTX-20260807-18291',
         confirmedAt: '2026-08-03T16:30:00Z',
+      },
+      channel: {
+        type: 'ExternalChannel',
+        name: 'Biletix',
+        reference: 'BTX-20260807-18291',
+      },
+      purchaserSnapshot: {
+        fullName: 'Tarık Özbalkan',
+        phone: '+905321002030',
+        email: 'tarik@example.com',
       },
       saleDate: '2026-08-03T16:30:00Z',
       grossPrice: 25000,

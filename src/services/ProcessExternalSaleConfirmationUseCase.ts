@@ -1,10 +1,12 @@
 import { MockDataStore } from '@/repositories/mock/MockRepositories';
 import { Sale } from '@/types/sale';
-import { AccountingEntry } from '@/types/accounting-entry';
 import { SalesChannel } from '@/types/sales-channel';
 import { VenueService } from './VenueService';
 import { IdGenerator } from '@/platform/IdGenerator';
-import { ClockProvider } from '@/platform/ClockProvider';
+import { InMemoryEventBus } from '@/application/EventBus';
+import { SaleRecordedDomainEvent } from '@/domain/events/DomainEvents';
+import { OperationsSaleRecordedHandler } from '@/operations/application/handlers/OperationsSaleRecordedHandler';
+import { AccountingSaleRecordedHandler } from '@/accounting/application/handlers/AccountingSaleRecordedHandler';
 
 export interface ProcessExternalSaleConfirmationCommand {
   reservationId?: string;
@@ -12,24 +14,25 @@ export interface ProcessExternalSaleConfirmationCommand {
   assetId: string;
   salesChannelId: string; // e.g. "biletix", "passo", "desk", "corporate"
   externalSaleReference: string; // e.g. "BTX-20260807-18291"
+  purchaserName?: string;
+  purchaserPhone?: string;
+  purchaserEmail?: string;
   idempotencyKey?: string;
-}
-
-export interface SaleRegisteredEvent {
-  eventName: 'SaleRegistered';
-  saleId: string;
-  eventId: string;
-  assetId: string;
-  reservationId?: string;
-  salesChannelId: string;
-  externalReference: string;
-  occurredAt: string;
 }
 
 export interface ProcessExternalSaleConfirmationResult {
   sale: Sale;
-  accountingEntries: AccountingEntry[];
-  event: SaleRegisteredEvent;
+  event: SaleRecordedDomainEvent;
+}
+
+// Subscribe Bounded Context Event Handlers once
+let isSubscribed = false;
+function setupEventSubscriptions() {
+  if (isSubscribed) return;
+  const eventBus = InMemoryEventBus.getInstance();
+  eventBus.subscribe('SaleRecorded', OperationsSaleRecordedHandler.handle);
+  eventBus.subscribe('SaleRecorded', AccountingSaleRecordedHandler.handle);
+  isSubscribed = true;
 }
 
 /**
@@ -37,15 +40,15 @@ export interface ProcessExternalSaleConfirmationResult {
  * 
  * Executing sequence:
  * 1. Validate Venue Asset Availability
- * 2. Create Sale Aggregate (with embedded ExternalConfirmation VO)
- * 3. Convert Reservation status if linked
- * 4. Update Venue Asset status to Sold
- * 5. Generate Double-Entry Accounting Entries
- * 6. Publish SaleRegistered Domain Event (Consumed asynchronously by external CRM/Ticketing/Wallet systems)
+ * 2. Create Sale Aggregate (with embedded ExternalConfirmation VO and PurchaserSnapshot VO)
+ * 3. Save Sale Aggregate to Repository
+ * 4. Publish SaleRecorded Domain Event (v1) via Application EventBus
+ * 5. Operations & Accounting BC Event Handlers execute asynchronously via EventBus
  */
 export class ProcessExternalSaleConfirmationUseCase {
   public static execute(cmd: ProcessExternalSaleConfirmationCommand): ProcessExternalSaleConfirmationResult {
-    // 1. Validate Asset Availability
+    setupEventSubscriptions();
+
     const asset = VenueService.getAssetById(cmd.assetId);
     if (!asset) throw new Error('Asset not found');
 
@@ -60,26 +63,36 @@ export class ProcessExternalSaleConfirmationUseCase {
       isArchived: false,
     };
     const channel = MockDataStore.salesChannels.find((c) => c.id === cmd.salesChannelId) ?? defaultChannel;
-    const nowISO = ClockProvider.nowISO();
+    const nowISO = new Date().toISOString();
     const grossPrice = asset.pricing.basePrice;
     const commissionRate = channel.commissionPercentage / 100;
     const commissionPaid = grossPrice * commissionRate;
     const netRevenue = grossPrice - commissionPaid;
 
-    // 2. Create Sale Aggregate Root
+    // 1. Create Sale Aggregate Root
     const saleId = IdGenerator.generateUUIDv7();
 
     const sale: Sale = {
       id: saleId,
       organizationId: MockDataStore.organizationId,
       eventId: cmd.eventId,
-      customerId: 'cust_tarik_01',
+      reservationId: cmd.reservationId,
       salesChannelId: cmd.salesChannelId,
       externalReference: cmd.externalSaleReference,
       externalConfirmation: {
         salesChannelId: cmd.salesChannelId,
         externalReference: cmd.externalSaleReference,
         confirmedAt: nowISO,
+      },
+      channel: {
+        type: 'ExternalChannel',
+        name: channel.name,
+        reference: cmd.externalSaleReference,
+      },
+      purchaserSnapshot: {
+        fullName: cmd.purchaserName || 'Emre Kaya',
+        phone: cmd.purchaserPhone || '+905351234567',
+        email: cmd.purchaserEmail || 'emre@vip.com',
       },
       saleDate: nowISO,
       grossPrice,
@@ -120,7 +133,7 @@ export class ProcessExternalSaleConfirmationUseCase {
     };
     MockDataStore.sales.push(sale);
 
-    // 3. Convert Reservation status if linked
+    // 2. Convert Reservation status if linked
     if (cmd.reservationId) {
       const res = MockDataStore.reservations.find((r) => r.id === cmd.reservationId);
       if (res) {
@@ -129,53 +142,26 @@ export class ProcessExternalSaleConfirmationUseCase {
       }
     }
 
-    // 4. Update Venue Asset status to Sold
-    VenueService.updateAsset(cmd.assetId, { status: 'Sold' });
-
-    // 5. Generate Double-Entry Accounting Entries
-    const accRevenue: AccountingEntry = {
-      id: IdGenerator.generateUUIDv7(),
-      organizationId: sale.organizationId,
-      eventId: sale.eventId,
-      sourceType: 'Sale',
-      sourceId: sale.id,
-      entryType: 'SaleRevenue',
-      amount: sale.grossPrice,
-      currency: sale.currency,
-      accountingAmount: sale.grossPrice,
-      occurredAt: nowISO,
-      createdAt: nowISO,
-    };
-    const accCommission: AccountingEntry = {
-      id: IdGenerator.generateUUIDv7(),
-      organizationId: sale.organizationId,
-      eventId: sale.eventId,
-      sourceType: 'Sale',
-      sourceId: sale.id,
-      entryType: 'PlatformCommission',
-      amount: -sale.commissionPaid,
-      currency: sale.currency,
-      accountingAmount: -sale.commissionPaid,
-      occurredAt: nowISO,
-      createdAt: nowISO,
-    };
-    MockDataStore.accountingEntries.push(accRevenue, accCommission);
-
-    // 6. Publish Domain Event: SaleRegistered
-    const event: SaleRegisteredEvent = {
-      eventName: 'SaleRegistered',
+    // 3. Publish SaleRecorded Domain Event (v1) via Application EventBus
+    const event: SaleRecordedDomainEvent = {
+      eventName: 'SaleRecorded',
+      header: {
+        eventId: IdGenerator.generateUUIDv7(),
+        version: 1,
+        occurredAt: nowISO,
+      },
       saleId: sale.id,
       eventId: sale.eventId,
       assetId: cmd.assetId,
       reservationId: cmd.reservationId,
       salesChannelId: cmd.salesChannelId,
       externalReference: cmd.externalSaleReference,
-      occurredAt: nowISO,
     };
+
+    InMemoryEventBus.getInstance().publish(event);
 
     return {
       sale,
-      accountingEntries: [accRevenue, accCommission],
       event,
     };
   }

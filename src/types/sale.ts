@@ -1,4 +1,5 @@
 import { CurrencyCode, Money } from './money';
+import { SalesChannelVO, PurchaserSnapshotVO } from './sales-channel-vo';
 
 export type SaleStatus =
   | 'PendingPayment'
@@ -72,10 +73,12 @@ export interface Sale {
   id: string; // UUID v7
   organizationId: string;
   eventId: string;
-  customerId: string;
+  reservationId?: string;
   salesChannelId: string; // e.g. "biletix", "passo", "desk"
   externalReference: string; // e.g. "BTX-20260807-18291"
   externalConfirmation?: ExternalConfirmationVO;
+  channel: SalesChannelVO;
+  purchaserSnapshot: PurchaserSnapshotVO;
   saleDate: string;
   
   grossPrice: number;

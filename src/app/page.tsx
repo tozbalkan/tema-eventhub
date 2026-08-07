@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   UserCheck, 
   Sparkles,
@@ -20,8 +20,9 @@ import { Input } from '@/components/ui/Input/Input';
 import { VenueService } from '@/services/VenueService';
 import { ReservationService } from '@/services/ReservationService';
 import { ProcessExternalSaleConfirmationUseCase } from '@/services/ProcessExternalSaleConfirmationUseCase';
+import { VenueAssetProjection, VenueAssetReadModel } from '@/operations/projections/VenueAssetProjection';
+import { AdmissionPolicy, AdmissionDecision } from '@/operations/domain/services/AdmissionPolicy';
 import { MockDataStore } from '@/repositories/mock/MockRepositories';
-import { VenueAsset } from '@/types/venue-asset';
 
 import {
   pageContainer,
@@ -79,8 +80,8 @@ interface TimelineLog {
 }
 
 export default function OperationalWorkspaceDesk() {
-  const [assets, setAssets] = useState<VenueAsset[]>(VenueService.getAssets());
-  const [selectedAsset, setSelectedAsset] = useState<VenueAsset | null>(assets[1] || null); // Default selected VIP A1
+  const [projections, setProjections] = useState<VenueAssetReadModel[]>([]);
+  const [selectedAssetId, setSelectedAssetId] = useState<string>('asset_vip_a1');
   
   // Akordiyon durum yönetimi
   const [accordionState, setAccordionState] = useState({
@@ -93,6 +94,7 @@ export default function OperationalWorkspaceDesk() {
   const [isReserveModalOpen, setIsReserveModalOpen] = useState(false);
   const [isSaleModalOpen, setIsSaleModalOpen] = useState(false);
   const [isCheckInModalOpen, setIsCheckInModalOpen] = useState(false);
+  const [admissionDecision, setAdmissionDecision] = useState<AdmissionDecision | null>(null);
 
   // Form durumları
   const [custName, setCustName] = useState('Emre Kaya');
@@ -101,18 +103,23 @@ export default function OperationalWorkspaceDesk() {
 
   // Canlı İşlem Zaman Çizelgesi
   const [timeline, setTimeline] = useState<TimelineLog[]>([
-    { time: '17:42', title: '✓ Satış Bildirimi İşlendi', sub: 'Biletix (Ref: BTX-20260807-18291) - Net: ₺23.500' },
-    { time: '17:40', title: '✓ SaleRegistered Event Yayınlandı', sub: 'Event Bus (External CRM & Wallet Notification)' },
+    { time: '17:42', title: '✓ SaleRecorded Domain Event (v1) Yayınlandı', sub: 'Biletix (Ref: BTX-20260807-18291) - Net: ₺23.500' },
+    { time: '17:40', title: '✓ VenueAssetProjection Handler Güncellendi', sub: 'Masa Statüsü: Satıldı | Satış Kanalı: Biletix' },
     { time: '17:38', title: '✓ Opsiyon Tanımlandı', sub: 'Selin Yılmaz (VIP Masa A2)' },
     { time: '17:30', title: '✓ Kapı Girişi Doğrulandı', sub: 'VIP Kuzey Kapısı (Tarık Özbalkan)' },
   ]);
 
-  const toggleAccordion = (key: keyof typeof accordionState) => {
-    setAccordionState((prev) => ({ ...prev, [key]: !prev[key] }));
+  const refreshData = () => {
+    VenueAssetProjection.initialize(VenueService.getAssets());
+    setProjections([...VenueAssetProjection.getAll()]);
   };
 
-  const refreshData = () => {
-    setAssets([...VenueService.getAssets()]);
+  useEffect(() => {
+    refreshData();
+  }, []);
+
+  const toggleAccordion = (key: keyof typeof accordionState) => {
+    setAccordionState((prev) => ({ ...prev, [key]: !prev[key] }));
   };
 
   const addTimeline = (title: string, sub: string) => {
@@ -120,23 +127,26 @@ export default function OperationalWorkspaceDesk() {
     setTimeline((prev) => [{ time: nowStr, title, sub }, ...prev]);
   };
 
+  const selectedAssetReadModel = projections.find((p) => p.assetId === selectedAssetId) || projections[0];
+  const fullAsset = selectedAssetReadModel ? VenueService.getAssetById(selectedAssetReadModel.assetId) : null;
+
   // İade / Opsiyon / Satış / Check-In İşlem Tetikleyicileri
   const handleReserve = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!selectedAsset) return;
+    if (!selectedAssetReadModel) return;
 
     try {
-      const res = ReservationService.createReservation({
+      ReservationService.createReservation({
         eventId: MockDataStore.event.id,
-        assetId: selectedAsset.id,
+        assetId: selectedAssetReadModel.assetId,
         customerName: custName,
         customerPhone: custPhone,
         customerEmail: custEmail,
-        guestCountPax: selectedAsset.paxCapacity,
+        guestCountPax: selectedAssetReadModel.paxCapacity,
       });
 
       addTimeline(
-        `✓ Opsiyon Tanımlandı: ${selectedAsset.name}`,
+        `✓ Opsiyon Tanımlandı: ${selectedAssetReadModel.name}`,
         `${custName} (${custPhone}) - 24 Saat Süreli Opsiyon`
       );
       setIsReserveModalOpen(false);
@@ -147,21 +157,24 @@ export default function OperationalWorkspaceDesk() {
   };
 
   const handleProcessExternalSaleConfirmation = () => {
-    if (!selectedAsset) return;
+    if (!selectedAssetReadModel) return;
 
     try {
       const ref = `BTX-20260807-${Math.floor(10000 + Math.random() * 90000)}`;
       // Execute ProcessExternalSaleConfirmationUseCase Application Use Case
       const result = ProcessExternalSaleConfirmationUseCase.execute({
         eventId: MockDataStore.event.id,
-        assetId: selectedAsset.id,
+        assetId: selectedAssetReadModel.assetId,
         salesChannelId: 'biletix',
         externalSaleReference: ref,
+        purchaserName: custName,
+        purchaserPhone: custPhone,
+        purchaserEmail: custEmail,
       });
 
       addTimeline(
-        `✓ Satış Kaydı Oluşturuldu: ${selectedAsset.name}`,
-        `Kanal: Biletix | Ref: ${ref} | Net Hakediş: ₺${result.sale.netRevenue.toLocaleString('tr-TR')} | Event: SaleRegistered`
+        `✓ SaleRecorded Event (v1) Yayınlandı: ${selectedAssetReadModel.name}`,
+        `Kanal: Biletix | Ref: ${ref} | Net Hakediş: ₺${result.sale.netRevenue.toLocaleString('tr-TR')}`
       );
 
       setIsSaleModalOpen(false);
@@ -172,47 +185,57 @@ export default function OperationalWorkspaceDesk() {
   };
 
   const handleCancelReservation = () => {
-    if (!selectedAsset) return;
-    const res = MockDataStore.reservations.find((r) => r.assetId === selectedAsset.id && r.status === 'Confirmed');
+    if (!selectedAssetReadModel) return;
+    const res = MockDataStore.reservations.find((r) => r.assetId === selectedAssetReadModel.assetId && r.status === 'Confirmed');
     if (!res) return;
 
     ReservationService.cancelReservation(res.id, 'ORGANIZER');
-    addTimeline(`✓ Opsiyon İptal Edildi: ${selectedAsset.name}`, `Masa tekrar müsait statüsüne çekildi.`);
+    addTimeline(`✓ Opsiyon İptal Edildi: ${selectedAssetReadModel.name}`, `Masa tekrar müsait statüsüne çekildi.`);
     refreshData();
   };
 
-  const handleCheckIn = () => {
-    if (!selectedAsset) return;
-    const activeSale = MockDataStore.sales.find((s) => s.lines.some((l) => l.venueAssetId === selectedAsset.id));
-    
-    MockDataStore.checkIns.push({
-      id: `chk_${Date.now()}`,
-      organizationId: MockDataStore.organizationId,
-      eventId: MockDataStore.event.id,
-      venueAssetId: selectedAsset.id,
-      saleId: activeSale?.id,
-      gateId: MockDataStore.gates[0]?.id || 'gate_vip_north',
-      guestName: 'Tarık Özbalkan',
-      checkedInAt: new Date().toISOString(),
-      checkedInBy: 'VIP Kapı Görevlisi',
-      status: 'Completed',
-    });
+  const openCheckInModal = () => {
+    if (!selectedAssetReadModel) return;
+    const decision = AdmissionPolicy.evaluate(selectedAssetReadModel.assetId);
+    setAdmissionDecision(decision);
+    setIsCheckInModalOpen(true);
+  };
 
-    addTimeline(`✓ Kapı Girişi Doğrulandı`, `${selectedAsset.name} VIP Kuzey Kapısından Giriş Yaptı`);
+  const handleCheckIn = () => {
+    if (!selectedAssetReadModel || !admissionDecision) return;
+
+    if (admissionDecision.outcome === 'Granted') {
+      MockDataStore.checkIns.push({
+        id: `chk_${Date.now()}`,
+        organizationId: MockDataStore.organizationId,
+        eventId: MockDataStore.event.id,
+        venueAssetId: selectedAssetReadModel.assetId,
+        gateId: MockDataStore.gates[0]?.id || 'gate_vip_north',
+        guestName: custName,
+        checkedInAt: new Date().toISOString(),
+        checkedInBy: 'VIP Kapı Görevlisi',
+        status: 'Completed',
+      });
+
+      addTimeline(`✓ Kapı Girişi Onaylandı (${admissionDecision.code})`, `${selectedAssetReadModel.name} VIP Kuzey Kapısından Giriş Yaptı`);
+    } else {
+      addTimeline(`❌ Kapı Girişi Reddedildi (${admissionDecision.code})`, admissionDecision.message);
+    }
+
     setIsCheckInModalOpen(false);
     refreshData();
   };
 
   // Target Customer details for selected asset
-  const activeReservation = selectedAsset ? MockDataStore.reservations.find((r) => r.assetId === selectedAsset.id && r.status === 'Confirmed') : undefined;
-  const activeSale = selectedAsset ? MockDataStore.sales.find((s) => s.lines.some((l) => l.venueAssetId === selectedAsset.id) && s.status === 'Completed') : undefined;
+  const activeReservation = selectedAssetReadModel ? MockDataStore.reservations.find((r) => r.assetId === selectedAssetReadModel.assetId && r.status === 'Confirmed') : undefined;
+  const activeSale = selectedAssetReadModel ? MockDataStore.sales.find((s) => s.lines.some((l) => l.venueAssetId === selectedAssetReadModel.assetId) && s.status === 'Completed') : undefined;
 
   return (
     <div className={pageContainer}>
       {/* Real-world Operational Workspace Header */}
       <header className={header}>
         <div className={logoGroup}>
-          <div className={logoBadge}>VIP OPERASYON MASASI</div>
+          <div className={logoBadge}>VIP OPERASYON MASASI (v1 BASELINE)</div>
           <div>
             <h1 className={headerTitle}>
               <Sparkles size={18} color="hsl(260 85% 65%)" /> {MockDataStore.event.name}
@@ -238,9 +261,9 @@ export default function OperationalWorkspaceDesk() {
         <div className={floorPlanPanel}>
           <div className={floorPlanHeader}>
             <div>
-              <h2 className={floorPlanTitle}>Canlı Oturma Haritası</h2>
+              <h2 className={floorPlanTitle}>Canlı Oturma Haritası (VenueAssetProjection)</h2>
               <p className={floorPlanSubTitle}>
-                Yangın Emniyeti Sınırı: {MockDataStore.venue.fireCapacity} PAX | Bir masa seçerek operasyonunu yönetin.
+                Yangın Emniyeti Sınırı: {MockDataStore.venue.fireCapacity} PAX | Okuma modelinden dinamik render edilir.
               </p>
             </div>
             <div className={floorPlanBadgeGroup}>
@@ -266,50 +289,45 @@ export default function OperationalWorkspaceDesk() {
               </defs>
               <rect width="100%" height="100%" fill="url(#grid)" />
 
-              {assets.map((asset) => {
-                const isSelected = selectedAsset?.id === asset.id;
-                let strokeColor = 'hsl(224 18% 24%)';
-                let fillColor = 'hsl(224 22% 12%)';
+              {projections.map((readModel) => {
+                const isSelected = selectedAssetId === readModel.assetId;
+                const assetGeometry = VenueService.getAssetById(readModel.assetId);
+                if (!assetGeometry) return null;
 
-                if (asset.status === 'Available') {
-                  fillColor = 'hsl(142 70% 45% / 0.15)';
-                  strokeColor = 'hsl(142 70% 45%)';
-                } else if (asset.status === 'Reserved') {
-                  fillColor = 'hsl(45 90% 50% / 0.2)';
-                  strokeColor = 'hsl(45 90% 50%)';
-                } else if (asset.status === 'Sold') {
-                  fillColor = 'hsl(350 80% 55% / 0.2)';
-                  strokeColor = 'hsl(350 80% 55%)';
-                } else if (asset.status === 'Blocked') {
-                  fillColor = 'hsl(220 15% 45% / 0.2)';
-                  strokeColor = 'hsl(220 15% 45%)';
-                }
+                const fillColor = readModel.status === 'Available' 
+                  ? 'hsl(142 70% 45% / 0.15)' 
+                  : readModel.status === 'Reserved' 
+                    ? 'hsl(45 90% 50% / 0.2)' 
+                    : readModel.status === 'Sold' 
+                      ? 'hsl(350 80% 55% / 0.2)' 
+                      : 'hsl(220 15% 45% / 0.2)';
 
+                let strokeColor = readModel.displayColor;
                 if (isSelected) {
                   strokeColor = 'hsl(260 85% 65%)';
                 }
 
                 return (
                   <g
-                    key={asset.id}
-                    onClick={() => setSelectedAsset(asset)}
-                    className={asset.category === 'Stage' ? svgGroupStage : svgGroupAsset}
+                    key={readModel.assetId}
+                    onClick={() => setSelectedAssetId(readModel.assetId)}
+                    className={readModel.category === 'Stage' ? svgGroupStage : svgGroupAsset}
                   >
-                    {asset.shape === 'Circle' ? (
+                    {assetGeometry.shape === 'Circle' ? (
                       <circle
-                        cx={asset.x + asset.width / 2}
-                        cy={asset.y + asset.height / 2}
-                        r={asset.width / 2}
+                        cx={assetGeometry.x + assetGeometry.width / 2}
+                        cy={assetGeometry.y + assetGeometry.height / 2}
+                        r={assetGeometry.width / 2}
                         fill={fillColor}
                         stroke={strokeColor}
                         strokeWidth={isSelected ? 3 : 1.5}
                       />
                     ) : (
                       <rect
-                        x={asset.x}
-                        y={asset.y}
-                        width={asset.width}
-                        height={asset.height}
+                        x={assetGeometry.x}
+                        y={assetGeometry.y}
+                        width={assetGeometry.width}
+                        height={assetGeometry.height}
                         rx={6}
                         fill={fillColor}
                         stroke={strokeColor}
@@ -317,14 +335,14 @@ export default function OperationalWorkspaceDesk() {
                       />
                     )}
                     <text
-                      x={asset.x + asset.width / 2}
-                      y={asset.y + asset.height / 2 + 4}
+                      x={assetGeometry.x + assetGeometry.width / 2}
+                      y={assetGeometry.y + assetGeometry.height / 2 + 4}
                       textAnchor="middle"
-                      fill={asset.category === 'Stage' ? 'hsl(224 15% 75%)' : 'hsl(0 0% 98%)'}
+                      fill={readModel.category === 'Stage' ? 'hsl(224 15% 75%)' : 'hsl(0 0% 98%)'}
                       fontSize="11"
                       fontWeight="600"
                     >
-                      {asset.name}
+                      {readModel.name}
                     </text>
                   </g>
                 );
@@ -339,35 +357,35 @@ export default function OperationalWorkspaceDesk() {
           <div className={card}>
             <div className={cardTitle} onClick={() => toggleAccordion('selected')}>
               <span className={cardTitleGroup}>
-                <Layers size={16} color="hsl(260 85% 65%)" /> Seçili Alan Detayı
+                <Layers size={16} color="hsl(260 85% 65%)" /> Seçili Alan Detayı (Read Model)
               </span>
               {accordionState.selected ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
             </div>
 
-            {accordionState.selected && selectedAsset && (
+            {accordionState.selected && selectedAssetReadModel && (
               <div className={accordionContent}>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <h3 className={floorPlanTitle}>{selectedAsset.name}</h3>
-                  {selectedAsset.status === 'Available' && <Badge variant="Available">● Müsait</Badge>}
-                  {selectedAsset.status === 'Reserved' && <Badge variant="Reserved">● Opsiyonda</Badge>}
-                  {selectedAsset.status === 'Sold' && <Badge variant="Sold">● Satıldı</Badge>}
-                  {selectedAsset.status === 'Blocked' && <Badge variant="Blocked">● Bloke</Badge>}
+                  <h3 className={floorPlanTitle}>{selectedAssetReadModel.name}</h3>
+                  {selectedAssetReadModel.status === 'Available' && <Badge variant="Available">● Müsait</Badge>}
+                  {selectedAssetReadModel.status === 'Reserved' && <Badge variant="Reserved">● Opsiyonda</Badge>}
+                  {selectedAssetReadModel.status === 'Sold' && <Badge variant="Sold">● Satıldı</Badge>}
+                  {selectedAssetReadModel.status === 'Blocked' && <Badge variant="Blocked">● Bloke</Badge>}
                 </div>
 
                 <div className={assetDetailGrid}>
                   <div className={assetDetailRow}>
-                    <span className={assetDetailLabel}>Grup / Zone</span>
-                    <span className={assetDetailValue}>{selectedAsset.groupName || 'Genel Saha'}</span>
+                    <span className={assetDetailLabel}>Operasyonel Statü</span>
+                    <span className={assetDetailValue}>{selectedAssetReadModel.occupancyState}</span>
                   </div>
 
                   <div className={assetDetailRow}>
                     <span className={assetDetailLabel}>Kapasite</span>
-                    <span className={assetDetailValue}>{selectedAsset.paxCapacity} Kişi</span>
+                    <span className={assetDetailValue}>{selectedAssetReadModel.paxCapacity} Kişi</span>
                   </div>
 
                   <div className={assetDetailRow}>
                     <span className={assetDetailLabel}>Liste Fiyatı</span>
-                    <span className={assetDetailValue}>₺{selectedAsset.pricing.basePrice.toLocaleString('tr-TR')}</span>
+                    <span className={assetDetailValue}>₺{selectedAssetReadModel.basePrice.toLocaleString('tr-TR')}</span>
                   </div>
 
                   {activeReservation && (
@@ -384,10 +402,6 @@ export default function OperationalWorkspaceDesk() {
                         <span className={assetDetailLabel}>Opsiyon Bitiş</span>
                         <span className={assetDetailValue}>18:42 (Kalan: 04sa 20dk)</span>
                       </div>
-                      <div className={assetDetailRow}>
-                        <span className={assetDetailLabel}>Temsilci</span>
-                        <span className={assetDetailValue}>Ahmet Yılmazer</span>
-                      </div>
                     </>
                   )}
 
@@ -395,26 +409,26 @@ export default function OperationalWorkspaceDesk() {
                     <>
                       <div className={assetDetailRow}>
                         <span className={assetDetailLabel}>Alıcı Müşteri</span>
-                        <span className={assetDetailValue}>Tarık Özbalkan</span>
+                        <span className={assetDetailValue}>{activeSale.purchaserSnapshot?.fullName || 'Tarık Özbalkan'}</span>
                       </div>
                       <div className={assetDetailRow}>
                         <span className={assetDetailLabel}>Satış Kanalı</span>
-                        <span className={assetDetailValue}>Biletix (Ref: BTX-20260807-18291)</span>
+                        <span className={assetDetailValue}>{activeSale.channel?.name || 'Biletix'} (Ref: {activeSale.externalReference})</span>
                       </div>
                     </>
                   )}
 
-                  {selectedAsset.metadata?.includedDrinks && (
+                  {fullAsset?.metadata?.includedDrinks && (
                     <div className={assetDetailRow}>
                       <span className={assetDetailLabel}>Dahil Olanlar</span>
-                      <span className={assetDetailValue}>{selectedAsset.metadata.includedDrinks.join(', ')}</span>
+                      <span className={assetDetailValue}>{fullAsset.metadata.includedDrinks.join(', ')}</span>
                     </div>
                   )}
                 </div>
 
                 {/* Operator Actions */}
                 <div className={selectedAssetActions}>
-                  {selectedAsset.status === 'Available' && (
+                  {selectedAssetReadModel.status === 'Available' && (
                     <>
                       <Button variant="secondary" onClick={() => setIsReserveModalOpen(true)}>
                         Opsiyonla & Rezerve Et
@@ -424,7 +438,7 @@ export default function OperationalWorkspaceDesk() {
                       </Button>
                     </>
                   )}
-                  {selectedAsset.status === 'Reserved' && (
+                  {selectedAssetReadModel.status === 'Reserved' && (
                     <>
                       <Button variant="primary" onClick={() => setIsSaleModalOpen(true)}>
                         Satışı Sisteme İşle
@@ -434,8 +448,8 @@ export default function OperationalWorkspaceDesk() {
                       </Button>
                     </>
                   )}
-                  {selectedAsset.status === 'Sold' && (
-                    <Button variant="secondary" icon={<ShieldCheck size={14} />} onClick={() => setIsCheckInModalOpen(true)}>
+                  {selectedAssetReadModel.status === 'Sold' && (
+                    <Button variant="secondary" icon={<ShieldCheck size={14} />} onClick={openCheckInModal}>
                       Kapı Giriş Doğrulaması Yap
                     </Button>
                   )}
@@ -509,7 +523,7 @@ export default function OperationalWorkspaceDesk() {
       <Modal
         isOpen={isReserveModalOpen}
         onClose={() => setIsReserveModalOpen(false)}
-        title={`${selectedAsset?.name} için Opsiyon Tanımla`}
+        title={`${selectedAssetReadModel?.name} için Opsiyon Tanımla`}
       >
         <form onSubmit={handleReserve} className={modalForm}>
           <Input label="Müşteri Ad Soyad" value={custName} onChange={(e) => setCustName(e.target.value)} required />
@@ -526,22 +540,22 @@ export default function OperationalWorkspaceDesk() {
       <Modal
         isOpen={isSaleModalOpen}
         onClose={() => setIsSaleModalOpen(false)}
-        title={`${selectedAsset?.name} - Dış Sistem Satış Bildirimi`}
+        title={`${selectedAssetReadModel?.name} - Dış Sistem Satış Bildirimi`}
       >
         <div className={modalStack}>
           <div className={modalPriceSummaryBox}>
             <p className={modalTextBase}>Satış Kanalı: <strong className={textBold}>Biletix</strong></p>
             <p className={modalTextMuted}>Dış Referans No: BTX-20260807-18291</p>
-            <p className={modalTextBase}>Brüt Tutarı: ₺{selectedAsset?.pricing.basePrice.toLocaleString('tr-TR')}</p>
-            <p className={modalTextSuccess}>Net Organizatör Hakedişi: ₺{((selectedAsset?.pricing.basePrice || 0) * 0.94).toLocaleString('tr-TR')}</p>
+            <p className={modalTextBase}>Brüt Tutarı: ₺{selectedAssetReadModel?.basePrice.toLocaleString('tr-TR')}</p>
+            <p className={modalTextSuccess}>Net Organizatör Hakedişi: ₺{((selectedAssetReadModel?.basePrice || 0) * 0.94).toLocaleString('tr-TR')}</p>
           </div>
 
           <p className={textSubtleSm}>
-            Dış kanaldan kesinleşen satışı StageOps operasyon defterine işler. Sırasıyla: Satış Kaydı ➔ Çift Taraflı Muhasebe Defteri ➔ Varlık Statüsü (Satıldı) ➔ SaleRegistered Event Yayınlanması gerçekleşir.
+            Dış kanaldan gelen satışı StageOps operasyon defterine işler. Sırasıyla: SaleRecorded Event (v1) ➔ Operations & Accounting Handlers ➔ VenueAssetProjection Güncellemesi gerçekleşir.
           </p>
 
           <Button variant="primary" onClick={handleProcessExternalSaleConfirmation}>
-            Satış Kaydını Oluştur & Sisteme İşle
+            Satış Kaydını Oluştur & Event Yayınla
           </Button>
         </div>
       </Modal>
@@ -550,26 +564,28 @@ export default function OperationalWorkspaceDesk() {
       <Modal
         isOpen={isCheckInModalOpen}
         onClose={() => setIsCheckInModalOpen(false)}
-        title={`${selectedAsset?.name} VIP Kapı Giriş Doğrulaması`}
+        title={`${selectedAssetReadModel?.name} VIP Kapı Giriş Doğrulaması`}
       >
         <div className={modalStack}>
           <p className={modalTextMuted}>
-            VIP Kuzey Kapısında misafir giriş yetkisi doğrulanır. Seçilen varlık için satış ve opsiyon kaydı kontrol edilir.
+            VIP Kuzey Kapısında AdmissionPolicy.evaluate() çalıştırılır. Karar nesnesi döner.
           </p>
 
-          <div className={modalTicketTokenBox}>
-            <p className={textBold}>Saha Varlığı: {selectedAsset?.name}</p>
-            <p className={modalTokenCode}>
-              Giriş Yetkisi: Tarık Özbalkan (Satış Ref: BTX-20260807-18291)
-            </p>
-          </div>
+          {admissionDecision && (
+            <div className={modalTicketTokenBox}>
+              <p className={textBold}>Karar Sonucu: {admissionDecision.outcome}</p>
+              <p className={modalTokenCode}>
+                Kod: {admissionDecision.code} | Mesaj: {admissionDecision.message}
+              </p>
+            </div>
+          )}
 
           <Button
             variant="primary"
             icon={<UserCheck size={16} />}
             onClick={handleCheckIn}
           >
-            Kapı Giriş Onayını Tamamla
+            Kapı Giriş Kararını İşle
           </Button>
         </div>
       </Modal>
