@@ -147,7 +147,7 @@ export class ProcessExternalSaleConfirmationUseCase {
       eventName: 'SaleRecorded',
       header: {
         eventId: IdGenerator.generateUUIDv7(),
-        version: 1,
+        eventVersion: 1,
         occurredAt: nowISO,
       },
       saleId: sale.id,

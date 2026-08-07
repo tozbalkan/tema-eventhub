@@ -1,6 +1,6 @@
 export interface EventHeader {
   eventId: string; // UUID v7
-  version: number; // e.g. 1
+  eventVersion: number; // e.g. 1
   occurredAt: string; // ISO string
 }
 
@@ -12,7 +12,8 @@ export interface DomainEvent {
 export type EventHandler<T extends DomainEvent = DomainEvent> = (event: T) => void | Promise<void>;
 
 export interface EventBus {
-  publish(eventOrEvents: DomainEvent | DomainEvent[]): void;
+  publish(event: DomainEvent): void;
+  publish(events: readonly DomainEvent[]): void;
   subscribe<T extends DomainEvent>(eventName: string, handler: EventHandler<T>): void;
   unsubscribe<T extends DomainEvent>(eventName: string, handler: EventHandler<T>): void;
 }
@@ -28,7 +29,7 @@ export class InMemoryEventBus implements EventBus {
     return InMemoryEventBus.instance;
   }
 
-  public publish(eventOrEvents: DomainEvent | DomainEvent[]): void {
+  public publish(eventOrEvents: DomainEvent | readonly DomainEvent[]): void {
     const events = Array.isArray(eventOrEvents) ? eventOrEvents : [eventOrEvents];
     events.forEach((event) => {
       const eventHandlers = this.handlers.get(event.eventName);

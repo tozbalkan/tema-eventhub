@@ -31,10 +31,10 @@ Inter-Bounded Context state-mutating communication MUST occur exclusively throug
     [Repository.save()]
             │
             ▼
-     [Domain Event]  (Minimal Past-Tense Fact)
+     [Domain Event]  (Minimal Past-Tense Fact with eventVersion)
             │
             ▼
-       [EventBus]    (Application Layer Abstraction)
+       [EventBus]    (In-Process Application Dispatcher)
             │
             ▼
  [BC Event Handler]  (Operations, Accounting, Notification)
@@ -45,7 +45,13 @@ Inter-Bounded Context state-mutating communication MUST occur exclusively throug
 
 ---
 
-## 3. CQRS Read-Only Query Exception
+## 3. In-Process Dispatcher vs Cross-Process Broker (Outbox Note)
+
+> **Architectural Note**: `EventBus` is an in-process memory dispatcher used within the StageOps deployment boundary. Cross-process delivery to external message brokers (e.g. RabbitMQ, Kafka, Azure Service Bus) is achieved through the **Transactional Outbox Pattern** via `OutboxPublisher`.
+
+---
+
+## 4. CQRS Read-Only Query Exception
 
 > **State-mutating operations MUST strictly follow Event-First communication. Read-only (query-only) operations may use synchronous, defined Query APIs or Read Model queries.**
 
@@ -55,20 +61,22 @@ Examples of allowed Read-Only Queries:
 
 ---
 
-## 4. Strict Architectural Rules for Developers
+## 5. Strict Architectural Rules for Developers
 
 1. **Forbidden Direct Mutating Invocations**:
    - `Sale Bounded Context` MUST NEVER call `AccountingService` or `VenueService` state-changing methods directly inside a Use Case.
    - It MUST create and persist the `Sale` aggregate, then call `eventBus.publish(new SaleRecordedDomainEvent(...))`.
-2. **Domain Event Autonomy**:
+2. **Domain Event Autonomy & Event Versioning**:
+   - Every Domain Event carries an `eventVersion` header (e.g. `eventVersion: 1`).
    - `Accounting Bounded Context` subscribes to `SaleRecorded` via `AccountingSaleRecordedHandler` and independently writes to `GeneralLedger`.
    - `Operations Bounded Context` subscribes to `SaleRecorded` via `OperationsSaleRecordedHandler` and independently updates `VenueAssetProjection`.
-3. **Read Model (Projection) Rendering**:
-   - The UI and API read endpoints MUST ONLY query Read Model Projections (`VenueAssetProjection`). Aggregates are reserved for write transactions only.
+3. **Read Model (Projection) Rendering & Optimistic Concurrency**:
+   - The UI and API read endpoints MUST ONLY query Read Model Projections (`VenueAssetProjection`).
+   - `Projection.version` represents **Optimistic Concurrency & UI State Revisioning**, separating it from `Aggregate.version` and `Event.eventVersion`.
 
 ---
 
-## 5. Consequences & Benefits
+## 6. Consequences & Benefits
 
 - **Zero Cascading Failures**: A failure in Accounting or Reporting handlers will never break the primary Sale registration transaction.
 - **Microservices Ready**: Moving a Bounded Context (e.g. Accounting or Operations) out into an independent microservice requires zero changes to the `Sale` domain logic—only swapping the `InMemoryEventBus` for a message broker (`RabbitMQ` / `Kafka`).
