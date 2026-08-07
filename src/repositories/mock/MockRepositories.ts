@@ -2,12 +2,11 @@ import { Venue, Gate } from '@/types/venue';
 import { Event } from '@/types/event';
 import { VenueAsset } from '@/types/venue-asset';
 import { Reservation } from '@/types/reservation';
-import { Sale, ExternalSaleConfirmation } from '@/types/sale';
+import { Sale } from '@/types/sale';
 import { AccountingEntry } from '@/types/accounting-entry';
 import { ReservationTicket, CheckIn } from '@/types/ticket';
 import { Customer } from '@/types/customer';
 import { SalesChannel } from '@/types/sales-channel';
-import { IdGenerator } from '@/platform/IdGenerator';
 
 export class MockDataStore {
   public static organizationId = 'org_indigo_01';
@@ -351,6 +350,11 @@ export class MockDataStore {
       customerId: 'cust_tarik_01',
       salesChannelId: 'biletix',
       externalReference: 'BTX-20260807-18291',
+      externalConfirmation: {
+        salesChannelId: 'biletix',
+        externalReference: 'BTX-20260807-18291',
+        confirmedAt: '2026-08-03T16:30:00Z',
+      },
       saleDate: '2026-08-03T16:30:00Z',
       grossPrice: 25000,
       commissionRate: 0.06,
@@ -390,16 +394,6 @@ export class MockDataStore {
     },
   ];
 
-  public static externalSaleConfirmations: ExternalSaleConfirmation[] = [
-    {
-      id: 'esc_01',
-      saleId: 'sale_a1_01',
-      salesChannelId: 'biletix',
-      externalReference: 'BTX-20260807-18291',
-      confirmedAt: '2026-08-03T16:30:00Z',
-    },
-  ];
-
   public static accountingEntries: AccountingEntry[] = [
     {
       id: 'acc_01',
@@ -436,7 +430,7 @@ export class MockDataStore {
       reservationId: 'res_a1_fake',
       saleId: 'sale_a1_01',
       venueAssetId: 'asset_vip_a1',
-      token: IdGenerator.generateTicketToken('VIP_A1'),
+      token: 'TKT_VIP_A1_987654',
       status: 'Active',
       version: 1,
       expiresAt: '2026-08-16T05:00:00Z',

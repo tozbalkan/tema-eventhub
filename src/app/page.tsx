@@ -19,7 +19,7 @@ import { Input } from '@/components/ui/Input/Input';
 
 import { VenueService } from '@/services/VenueService';
 import { ReservationService } from '@/services/ReservationService';
-import { RegisterExternalSaleUseCase } from '@/services/RegisterExternalSaleUseCase';
+import { ProcessExternalSaleConfirmationUseCase } from '@/services/ProcessExternalSaleConfirmationUseCase';
 import { MockDataStore } from '@/repositories/mock/MockRepositories';
 import { VenueAsset } from '@/types/venue-asset';
 
@@ -101,7 +101,7 @@ export default function OperationalWorkspaceDesk() {
 
   // Canlı İşlem Zaman Çizelgesi
   const [timeline, setTimeline] = useState<TimelineLog[]>([
-    { time: '17:42', title: '✓ Biletix Satış Bildirimi Alındı', sub: 'Ref: BTX-20260807-18291 (Net: ₺23.500)' },
+    { time: '17:42', title: '✓ Biletix Satış Bildirimi İşlendi', sub: 'Ref: BTX-20260807-18291 (Net: ₺23.500)' },
     { time: '17:40', title: '✓ Satış Kanalı Doğrulandı', sub: 'Kanal: Biletix' },
     { time: '17:39', title: '✓ Bilet Düzenlendi', sub: 'Token: VIP_A1_87F4A0B2' },
     { time: '17:38', title: '✓ Opsiyon Oluşturuldu', sub: 'Selin Yılmaz (VIP Masa A2)' },
@@ -147,13 +147,13 @@ export default function OperationalWorkspaceDesk() {
     }
   };
 
-  const handleRegisterExternalSale = () => {
+  const handleProcessExternalSaleConfirmation = () => {
     if (!selectedAsset) return;
 
     try {
       const ref = `BTX-20260807-${Math.floor(10000 + Math.random() * 90000)}`;
-      // Execute RegisterExternalSaleUseCase Application Use Case
-      const result = RegisterExternalSaleUseCase.execute({
+      // Execute ProcessExternalSaleConfirmationUseCase Application Use Case
+      const result = ProcessExternalSaleConfirmationUseCase.execute({
         eventId: MockDataStore.event.id,
         assetId: selectedAsset.id,
         salesChannelId: 'biletix',
@@ -161,7 +161,7 @@ export default function OperationalWorkspaceDesk() {
       });
 
       addTimeline(
-        `✓ Dış Sistem Satış Bildirimi İşlendi: ${selectedAsset.name}`,
+        `✓ Dış Satış Bildirimi İşlendi: ${selectedAsset.name}`,
         `Kanal: Biletix | Ref: ${ref} | Net Hakediş: ₺${result.sale.netRevenue.toLocaleString('tr-TR')} (Bilet Token: ${result.ticket.token})`
       );
 
@@ -431,7 +431,7 @@ export default function OperationalWorkspaceDesk() {
                   {selectedAsset.status === 'Reserved' && (
                     <>
                       <Button variant="primary" onClick={() => setIsSaleModalOpen(true)}>
-                        Satışı Onayla & Bilet Düzenle
+                        Satışı Kaydet & Bilet Düzenle
                       </Button>
                       <Button variant="danger" onClick={handleCancelReservation}>
                         Opsiyonu İptal Et
@@ -534,7 +534,7 @@ export default function OperationalWorkspaceDesk() {
       >
         <div className={modalStack}>
           <div className={modalPriceSummaryBox}>
-            <p className={modalTextBase}>Satış Kanalı: <strong className={textBold}>Biletix POS</strong></p>
+            <p className={modalTextBase}>Satış Kanalı: <strong className={textBold}>Biletix</strong></p>
             <p className={modalTextMuted}>Dış Referans No: BTX-20260807-18291</p>
             <p className={modalTextBase}>Brüt Tutarı: ₺{selectedAsset?.pricing.basePrice.toLocaleString('tr-TR')}</p>
             <p className={modalTextSuccess}>Net Organizatör Hakedişi: ₺{((selectedAsset?.pricing.basePrice || 0) * 0.94).toLocaleString('tr-TR')}</p>
@@ -544,8 +544,8 @@ export default function OperationalWorkspaceDesk() {
             Biletix / Passo kanalından gelen satış bildirimini StageOps operasyon defterine işler. Sırasıyla: Satış Kaydı ➔ Çift Taraflı Muhasebe Defteri ➔ Bilet Üretimi gerçekleşir.
           </p>
 
-          <Button variant="primary" onClick={handleRegisterExternalSale}>
-            Satışı Onayla & Bileti Düzenle
+          <Button variant="primary" onClick={handleProcessExternalSaleConfirmation}>
+            Satışı Sisteme İşle & Bileti Düzenle
           </Button>
         </div>
       </Modal>

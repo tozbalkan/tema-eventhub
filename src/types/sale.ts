@@ -41,9 +41,7 @@ export interface RevenueSplitVO {
   taxAmount: Money;
 }
 
-export interface ExternalSaleConfirmation {
-  id: string; // UUID v7
-  saleId: string;
+export interface ExternalConfirmationVO {
   salesChannelId: string;
   externalReference: string;
   confirmedAt: string;
@@ -79,6 +77,7 @@ export interface Sale {
   customerId: string;
   salesChannelId: string; // e.g. "biletix", "passo", "desk"
   externalReference: string; // e.g. "BTX-20260807-18291"
+  externalConfirmation?: ExternalConfirmationVO;
   saleDate: string;
   
   grossPrice: number;
