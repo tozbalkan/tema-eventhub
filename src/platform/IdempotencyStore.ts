@@ -2,12 +2,15 @@ export interface IdempotencyRecord {
   key: string;
   createdAt: string;
   expiresAt: string; // 24-hour TTL
+  completedAt?: string;
+  lastAccessedAt?: string;
+  attemptCount: number;
   status: 'Processing' | 'Completed' | 'Failed';
   responsePayload?: any;
 }
 
 /**
- * In-Process Memory Atomic Idempotency Lock & Response Cache with 24h TTL.
+ * In-Process Memory Atomic Idempotency Lock & Response Cache with 24h TTL & Troubleshooting Metadata.
  * 
  * Note for Multi-Pod Distributed Scaling:
  * In multi-node cluster deployments (Kubernetes, Serverless), this store is backed by
@@ -29,11 +32,16 @@ export class IdempotencyStore {
   }
 
   /**
-   * Atomic in-process lock acquisition with TTL check
+   * Atomic in-process lock acquisition with TTL check and attempt tracking
    */
   public static tryAcquireLock(key: string): boolean {
     IdempotencyStore.cleanupExpired();
     const existing = IdempotencyStore.store.get(key);
+
+    if (existing) {
+      existing.lastAccessedAt = new Date().toISOString();
+      existing.attemptCount += 1;
+    }
 
     if (IdempotencyStore.activeLocks.has(key) || (existing && existing.status === 'Processing')) {
       return false; // Lock acquisition failed: currently processing
@@ -51,6 +59,8 @@ export class IdempotencyStore {
       key,
       createdAt: now.toISOString(),
       expiresAt,
+      lastAccessedAt: now.toISOString(),
+      attemptCount: 1,
       status: 'Processing',
     });
     return true;
@@ -65,6 +75,8 @@ export class IdempotencyStore {
     const existing = IdempotencyStore.store.get(key);
     if (existing) {
       existing.status = 'Completed';
+      existing.completedAt = new Date().toISOString();
+      existing.lastAccessedAt = existing.completedAt;
       existing.responsePayload = responsePayload;
     }
   }
@@ -76,6 +88,10 @@ export class IdempotencyStore {
 
   public static getRecord(key: string): IdempotencyRecord | undefined {
     IdempotencyStore.cleanupExpired();
-    return IdempotencyStore.store.get(key);
+    const record = IdempotencyStore.store.get(key);
+    if (record) {
+      record.lastAccessedAt = new Date().toISOString();
+    }
+    return record;
   }
 }

@@ -1,4 +1,5 @@
 import { StructuredJsonLogger } from '@/platform/Logger';
+import { deepFreeze } from '@/platform/utils';
 
 export interface EventHeader {
   readonly eventId: string; // UUID v7
@@ -43,8 +44,10 @@ export class InMemoryEventBus implements EventBus {
     for (const event of events) {
       const eventHandlers = this.handlers.get(event.eventName);
       if (eventHandlers) {
+        // Apply deepFreeze to guarantee 100% deep immutability across all nested event properties
+        const immutableEvent = deepFreeze(event);
         const promises = Array.from(eventHandlers).map((handler) =>
-          Promise.resolve(handler(Object.freeze(event))).catch((err) => {
+          Promise.resolve(handler(immutableEvent)).catch((err) => {
             this.logger.error(`Error executing event handler for ${event.eventName}`, err, {
               eventId: event.header.eventId,
               correlationId: event.header.correlationId,
