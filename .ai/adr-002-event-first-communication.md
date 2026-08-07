@@ -37,7 +37,7 @@ Inter-Bounded Context state-mutating communication MUST occur exclusively throug
        Eventual Consistency
 ```
 
-*Architectural Principle*: StageOps does not rely on exactly-once delivery semantics. End-to-end exactly-once side effects are not assumed. Duplicate delivery is expected and correctness is achieved through idempotent consumers and transactional state changes. **We don't need exactly-once delivery to guarantee correct business effects.**
+*Architectural Principle*: StageOps does not rely on exactly-once delivery semantics. End-to-end exactly-once side effects are not assumed. Duplicate delivery is expected and correctness is achieved through idempotent consumers and transactional state changes. At-Least-Once delivery + idempotent consumers provide duplicate-safe eventual convergence, **provided failed messages are eventually retried or replayed successfully**.
 
 ---
 
@@ -175,7 +175,7 @@ Domain event payloads MUST be **JSON-serializable only**. No `Date`, `Map`, `Set
 
 ## 10. Consequences & Benefits
 
-- **Zero Cascading Failures**: A failure in Accounting or Reporting handlers will never break the primary Sale registration transaction.
+- **Primary Transaction Isolation**: Downstream consumer failures do not roll back the primary aggregate transaction. A failure in Accounting or Reporting handlers will not break the Sale registration.
 - **Transport-Independent Domain Logic**: Bounded Context domain and application logic is designed to remain independent of the transport mechanism. Extracting a context into an independent microservice primarily requires infrastructure and deployment changes (broker adapter, serialization, durable consumer idempotency, observability) rather than redesigning its domain communication model.
 - **Parallel Team Velocity**: Autonomous teams can build new listeners (e.g. VIP SMS Notification Handler, Analytics Handler) without touching core codebase.
 - **Duplicate Safety**: Consumer idempotency guarantees correct results even under At-Least-Once delivery.
