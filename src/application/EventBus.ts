@@ -12,9 +12,7 @@ export interface DomainEvent {
 export type EventHandler<T extends DomainEvent = DomainEvent> = (event: T) => void | Promise<void>;
 
 export interface EventBus {
-  publish(event: DomainEvent): void;
-  publishAll(events: DomainEvent[]): void;
-  publishMany(events: DomainEvent[]): void;
+  publish(eventOrEvents: DomainEvent | DomainEvent[]): void;
   subscribe<T extends DomainEvent>(eventName: string, handler: EventHandler<T>): void;
   unsubscribe<T extends DomainEvent>(eventName: string, handler: EventHandler<T>): void;
 }
@@ -30,25 +28,20 @@ export class InMemoryEventBus implements EventBus {
     return InMemoryEventBus.instance;
   }
 
-  public publish(event: DomainEvent): void {
-    const eventHandlers = this.handlers.get(event.eventName);
-    if (eventHandlers) {
-      eventHandlers.forEach((handler) => {
-        try {
-          handler(event);
-        } catch (err) {
-          console.error(`Error in event handler for ${event.eventName}:`, err);
-        }
-      });
-    }
-  }
-
-  public publishAll(events: DomainEvent[]): void {
-    events.forEach((event) => this.publish(event));
-  }
-
-  public publishMany(events: DomainEvent[]): void {
-    this.publishAll(events);
+  public publish(eventOrEvents: DomainEvent | DomainEvent[]): void {
+    const events = Array.isArray(eventOrEvents) ? eventOrEvents : [eventOrEvents];
+    events.forEach((event) => {
+      const eventHandlers = this.handlers.get(event.eventName);
+      if (eventHandlers) {
+        eventHandlers.forEach((handler) => {
+          try {
+            handler(event);
+          } catch (err) {
+            console.error(`Error in event handler for ${event.eventName}:`, err);
+          }
+        });
+      }
+    });
   }
 
   public subscribe<T extends DomainEvent>(eventName: string, handler: EventHandler<T>): void {

@@ -47,6 +47,7 @@ This Architecture Decision Record (ADR) establishes the **uncompromised product 
    - If a new feature requests processing payments, it MUST be executed on external POS/e-commerce systems which then notify StageOps via external sale registration webhooks.
 3. **Keep Domain Events Minimal & Fact-Based**:
    - Internal Domain Events (e.g., `SaleRecorded`) MUST contain minimal identity headers and facts (`saleId`, `eventId`). Handlers pull aggregate state from repositories asynchronously.
+   - *Pragmatism Note*: Minimal payload is a default rule. If multiple event handlers cause heavy redundant repository queries in high-throughput streams, payloads may be pragmatically extended to include frequently accessed immutable fields.
 4. **Read Models (Projections) Drive the UI**:
    - The UI MUST render 100% of its state from passive projections (e.g., `VenueAssetProjection`). It MUST NEVER read directly from mutable domain aggregates.
 

@@ -16,9 +16,9 @@ This tight coupling leads to fragile code, cascading runtime failures, difficult
 
 ## 2. Core Communication Rule (Event-First Mandate)
 
-> **No Bounded Context is permitted to invoke the Application Services or mutate the Aggregates of another Bounded Context directly.**
+> **No Bounded Context is permitted to invoke state-mutating Application Services or mutate the Aggregates of another Bounded Context directly.**
 
-Inter-Bounded Context communication MUST occur exclusively through **Asynchronous Domain Events over the `EventBus`**.
+Inter-Bounded Context state-mutating communication MUST occur exclusively through **Asynchronous Domain Events over the `EventBus`**.
 
 ### Standard Execution Pipeline:
 ```
@@ -45,10 +45,20 @@ Inter-Bounded Context communication MUST occur exclusively through **Asynchronou
 
 ---
 
-## 3. Strict Architectural Rules for Developers
+## 3. CQRS Read-Only Query Exception
 
-1. **Forbidden Direct Service Invocations**:
-   - `Sale Bounded Context` MUST NEVER call `AccountingService` or `VenueService` methods directly inside a Use Case.
+> **State-mutating operations MUST strictly follow Event-First communication. Read-only (query-only) operations may use synchronous, defined Query APIs or Read Model queries.**
+
+Examples of allowed Read-Only Queries:
+- `Reservation Bounded Context` querying `VenueAvailabilityQuery` to verify asset layout limits.
+- `Operations Bounded Context` querying `CurrencyRateQuery` for display conversion.
+
+---
+
+## 4. Strict Architectural Rules for Developers
+
+1. **Forbidden Direct Mutating Invocations**:
+   - `Sale Bounded Context` MUST NEVER call `AccountingService` or `VenueService` state-changing methods directly inside a Use Case.
    - It MUST create and persist the `Sale` aggregate, then call `eventBus.publish(new SaleRecordedDomainEvent(...))`.
 2. **Domain Event Autonomy**:
    - `Accounting Bounded Context` subscribes to `SaleRecorded` via `AccountingSaleRecordedHandler` and independently writes to `GeneralLedger`.
@@ -58,7 +68,7 @@ Inter-Bounded Context communication MUST occur exclusively through **Asynchronou
 
 ---
 
-## 4. Consequences & Benefits
+## 5. Consequences & Benefits
 
 - **Zero Cascading Failures**: A failure in Accounting or Reporting handlers will never break the primary Sale registration transaction.
 - **Microservices Ready**: Moving a Bounded Context (e.g. Accounting or Operations) out into an independent microservice requires zero changes to the `Sale` domain logic—only swapping the `InMemoryEventBus` for a message broker (`RabbitMQ` / `Kafka`).
