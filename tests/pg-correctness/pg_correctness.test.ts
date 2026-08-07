@@ -12,7 +12,7 @@ import { IdGenerator } from '@/platform/IdGenerator';
 import fs from 'fs';
 import path from 'path';
 
-describe('PostgreSQL Correctness Baseline (T1 - T34 Integration Tests)', () => {
+describe('PostgreSQL Correctness Baseline (T1 - T38 Integration Tests)', () => {
   let pool: Pool;
 
   beforeAll(async () => {
@@ -916,7 +916,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T34 Integration Tests)', () => {
     expect(duplicateCount).toBe(14);
   });
 
-  it('T32: Basic Database Accessibility & Schema Structure Sanity Check', async () => {
+  it('T32: Basic Database Accessibility & System Catalog Index Definition Sanity Check', async () => {
     const requiredTables = ['sales', 'sale_lines', 'outbox_messages', 'venue_asset_projections', 'accounting_entries', 'processed_events'];
     const tablesRes = await pool.query(
       `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name = ANY($1)`,
@@ -926,8 +926,11 @@ describe('PostgreSQL Correctness Baseline (T1 - T34 Integration Tests)', () => {
     const foundTables = tablesRes.rows.map((r) => r.table_name);
     expect(foundTables.length).toBe(requiredTables.length);
 
-    const indexRes = await pool.query(`SELECT indexname FROM pg_indexes WHERE indexname = 'ux_accounting_source_entry'`);
+    const indexRes = await pool.query(`SELECT indexdef FROM pg_indexes WHERE indexname = 'ux_accounting_source_entry'`);
     expect(indexRes.rows.length).toBe(1);
+    expect(indexRes.rows[0].indexdef.toLowerCase()).toContain('accounting_entries');
+    expect(indexRes.rows[0].indexdef.toLowerCase()).toContain('source_type');
+    expect(indexRes.rows[0].indexdef.toLowerCase()).toContain('source_id');
   });
 
   it('T33: Same External Reference + Different Assets Phantom Protection', async () => {
@@ -1029,5 +1032,155 @@ describe('PostgreSQL Correctness Baseline (T1 - T34 Integration Tests)', () => {
     expect(successfulSales.length).toBe(1);
     expect(errors.length).toBe(1);
     expect(errors[0]).toContain('SEAT_ALREADY_RESERVED');
+  });
+
+  it('T35: Multi-Asset Partial Lock Failure Atomicity — Complete rollback on any locked seat failure', async () => {
+    const assetAvailable1 = 'asset_vip_a2';
+    const assetSold = 'asset_vip_a1'; // asset_vip_a1 is pre-populated/marked Sold
+    const assetAvailable2 = 'asset_vip_a3';
+
+    await pool.query(
+      `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
+       VALUES 
+        ($1, 'VIP A2', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW()),
+        ($2, 'VIP A1', 'VIP', 'Sold', 'Occupied', 6, 25000, 1, NOW()),
+        ($3, 'VIP A3', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW());`,
+      [assetAvailable1, assetSold, assetAvailable2]
+    );
+
+    const command = {
+      eventId: 'event_gala_2026',
+      assetIds: [assetAvailable1, assetSold, assetAvailable2],
+      salesChannelId: 'biletix',
+      externalSaleReference: 'BTX-PARTIAL-FAIL-001',
+    };
+
+    await expect(
+      UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+      )
+    ).rejects.toThrow('SEAT_ALREADY_RESERVED');
+
+    // Verify COMPLETE ROLLBACK: Neither assetAvailable1 nor assetAvailable2 were marked Sold!
+    const proj1 = await pool.query('SELECT status FROM venue_asset_projections WHERE asset_id = $1', [assetAvailable1]);
+    const proj2 = await pool.query('SELECT status FROM venue_asset_projections WHERE asset_id = $1', [assetAvailable2]);
+    const dbSales = await pool.query('SELECT * FROM sales WHERE external_reference = $1', [command.externalSaleReference]);
+
+    expect(proj1.rows[0].status).toBe('Available');
+    expect(proj2.rows[0].status).toBe('Available');
+    expect(dbSales.rows.length).toBe(0);
+  });
+
+  it('T36: Multi-Asset Duplicate Command Race — 2 parallel multi-seat commands produce exactly 1 sale', async () => {
+    const command = {
+      eventId: 'event_gala_2026',
+      assetIds: ['asset_vip_a2', 'asset_vip_a3'],
+      salesChannelId: 'biletix',
+      externalSaleReference: 'BTX-MULTI-DUP-001',
+    };
+
+    const task1 = UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+    );
+
+    const task2 = UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+    );
+
+    const results = await Promise.all([task1, task2]);
+    const originalCount = results.filter((r) => !r.isDuplicateRecord).length;
+    const duplicateCount = results.filter((r) => r.isDuplicateRecord).length;
+
+    expect(originalCount).toBe(1);
+    expect(duplicateCount).toBe(1);
+
+    const dbSales = await pool.query('SELECT * FROM sales WHERE external_reference = $1', [command.externalSaleReference]);
+    const dbLines = await pool.query('SELECT * FROM sale_lines WHERE sale_id = $1', [dbSales.rows[0].id]);
+
+    expect(dbSales.rows.length).toBe(1);
+    expect(dbLines.rows.length).toBe(2);
+  });
+
+  it('T37: Overlapping Multi-Asset Sets Race — Zero overselling on shared asset', async () => {
+    const assetA = 'asset_vip_a2';
+    const assetB = 'asset_vip_a3'; // Shared overlapping asset
+    const assetC = 'asset_vip_a4';
+
+    await pool.query(
+      `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
+       VALUES 
+        ($1, 'VIP A2', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW()),
+        ($2, 'VIP A3', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW()),
+        ($3, 'VIP A4', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW());`,
+      [assetA, assetB, assetC]
+    );
+
+    // Worker 1 requests [A, B], Worker 2 requests [B, C]
+    const task1 = UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({
+        eventId: 'event_gala_2026',
+        assetIds: [assetA, assetB],
+        salesChannelId: 'biletix',
+        externalSaleReference: 'BTX-OVERLAP-1',
+        pgClient: tx,
+      })
+    ).catch((err: Error) => ({ error: err.message }));
+
+    const task2 = UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({
+        eventId: 'event_gala_2026',
+        assetIds: [assetB, assetC],
+        salesChannelId: 'passo',
+        externalSaleReference: 'PASSO-OVERLAP-2',
+        pgClient: tx,
+      })
+    ).catch((err: Error) => ({ error: err.message }));
+
+    const results = await Promise.all([task1, task2]);
+    const successfulSales = results.filter((r) => 'sale' in r);
+    const rejectedSales = results.filter((r) => 'error' in r && r.error.includes('SEAT_ALREADY_RESERVED'));
+
+    expect(successfulSales.length).toBe(1);
+    expect(rejectedSales.length).toBe(1);
+
+    // Verify shared assetB was sold ONCE and only 1 sale line exists for assetB
+    const assetBLines = await pool.query('SELECT * FROM sale_lines WHERE venue_asset_id = $1', [assetB]);
+    expect(assetBLines.rows.length).toBe(1);
+  });
+
+  it('T38: Lease Expiration End-to-End Fencing — Stale worker markPublished is blocked after lease version increments', async () => {
+    const eventId = IdGenerator.generateUUIDv7();
+    const saleId = IdGenerator.generateUUIDv7();
+    const event: SaleRecordedDomainEvent = {
+      eventName: DomainEventNames.SaleRecorded,
+      header: { eventId, eventVersion: 1, occurredAt: new Date().toISOString() },
+      saleId,
+      eventId: IdGenerator.generateUUIDv7(),
+    };
+
+    await UnitOfWork.execute((tx) => PgOutboxStore.addMessage(tx, 'Sale', saleId, event));
+
+    // Worker A claims with 0s lease duration (expires immediately)
+    const claimedA = await PgOutboxStore.claimPendingMessages('worker_A', 1, 0);
+    const msgA = claimedA[0]!;
+    expect(msgA.leaseVersion).toBe(1);
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Worker B claims expired message (lease version becomes 2)
+    const claimedB = await PgOutboxStore.claimPendingMessages('worker_B', 1, 30);
+    const msgB = claimedB[0]!;
+    expect(msgB.leaseVersion).toBe(2);
+
+    // Stale Worker A attempts to call markPublished
+    const workerAFenced = await PgOutboxStore.markPublished(msgA.id, 'worker_A', msgA.leaseVersion);
+    expect(workerAFenced).toBe(false);
+
+    // Valid Worker B calls markPublished
+    const workerBPublished = await PgOutboxStore.markPublished(msgB.id, 'worker_B', msgB.leaseVersion);
+    expect(workerBPublished).toBe(true);
+
+    const finalOutbox = await PgOutboxStore.getMessageById(eventId);
+    expect(finalOutbox?.status).toBe('Published');
   });
 });

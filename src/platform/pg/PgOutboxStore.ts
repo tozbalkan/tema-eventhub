@@ -55,6 +55,7 @@ export class PgOutboxStore {
 
   /**
    * Atomic Lease Claiming using CTE and FOR UPDATE SKIP LOCKED.
+   * Deterministic ordering by occurred_at, id.
    * Increments lease_version (fencing token) on every claim.
    */
   public static async claimPendingMessages(
@@ -76,7 +77,7 @@ export class PgOutboxStore {
           )
         )
         AND retry_count < max_retries
-        ORDER BY occurred_at
+        ORDER BY occurred_at, id
         FOR UPDATE SKIP LOCKED
         LIMIT $2
       )
@@ -137,7 +138,7 @@ export class PgOutboxStore {
         status = CASE WHEN retry_count + 1 >= max_retries THEN 'DeadLetter' ELSE 'Failed' END,
         retry_count = retry_count + 1,
         last_error = $4,
-        next_retry_at = NOW() + ((POWER(2, retry_count + 1) + (RANDOM() * POWER(2, retry_count + 1) * 0.25)) * INTERVAL '1 second'),
+        next_retry_at = NOW() + (LEAST(POWER(2, retry_count + 1) + (RANDOM() * POWER(2, retry_count + 1) * 0.25), 300) * INTERVAL '1 second'),
         locked_by = NULL,
         locked_until = NULL
       WHERE id = $1 AND locked_by = $2 AND lease_version = $3;
