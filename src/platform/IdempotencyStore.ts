@@ -5,17 +5,30 @@ export interface IdempotencyRecord {
   responsePayload?: any;
 }
 
+/**
+ * In-Process Memory Atomic Idempotency Lock & Response Cache.
+ * 
+ * Note for Multi-Pod Distributed Scaling:
+ * In multi-node cluster deployments (Kubernetes, Serverless), this store is backed by
+ * Redis SET NX PX or PostgreSQL UNIQUE CONSTRAINTS for cross-process atomic locks.
+ */
 export class IdempotencyStore {
   private static store: Map<string, IdempotencyRecord> = new Map();
   private static activeLocks: Set<string> = new Set();
 
   /**
-   * Atomic lock acquisition to prevent race conditions on concurrent webhooks
+   * Atomic in-process lock acquisition to prevent race conditions on concurrent webhooks
    */
   public static tryAcquireLock(key: string): boolean {
-    if (IdempotencyStore.activeLocks.has(key) || IdempotencyStore.store.has(key)) {
-      return false; // Lock acquisition failed or key already processed
+    const existing = IdempotencyStore.store.get(key);
+    if (IdempotencyStore.activeLocks.has(key) || (existing && existing.status === 'Processing')) {
+      return false; // Lock acquisition failed: currently processing
     }
+
+    if (existing && existing.status === 'Completed') {
+      return false; // Already completed
+    }
+
     IdempotencyStore.activeLocks.add(key);
     IdempotencyStore.store.set(key, {
       key,

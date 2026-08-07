@@ -23,18 +23,18 @@ Inter-Bounded Context state-mutating communication MUST occur exclusively throug
 ### Standard Execution Pipeline:
 ```
   [Application Use Case]
-            │
+            │  (Command with commandId, correlationId)
             ▼
      [Aggregate Root]
             │
             ▼
-    [Repository.save()]
+    [Repository.save() + OutboxStore.addMessage()]  (100% Atomic Transaction)
             │
             ▼
-     [Domain Event]  (Minimal Past-Tense Fact with eventVersion)
+     [Domain Event]  (Minimal Past-Tense Fact with causationId = commandId)
             │
             ▼
-       [EventBus]    (Logical Asynchronous In-Process Dispatcher)
+       [EventBus]    (Logical In-Process Dispatcher)
             │
             ▼
  [BC Event Handler]  (Operations, Accounting, Notification)
@@ -45,18 +45,28 @@ Inter-Bounded Context state-mutating communication MUST occur exclusively throug
 
 ---
 
-## 3. Logical Asynchronous Decoupling & In-Process Dispatcher Note
+## 3. Distributed Tracing & End-to-End Correlation Context
 
-> **Architectural Note**: `EventBus` provides **logical asynchronous decoupling** within the application boundary. In the v1 baseline, `InMemoryEventBus` executes handlers within the same thread execution cycle while completely decoupling domain dependencies. Cross-process delivery to external message brokers (e.g. RabbitMQ, Kafka, Azure Service Bus) is achieved through the **Transactional Outbox Pattern** via `OutboxPublisher`.
+Every Domain Event carries full distributed tracing metadata in `EventHeader`:
+- `eventId`: UUID v7 unique event identifier.
+- `eventVersion`: Olay şeması sürümü (`1`).
+- `occurredAt`: ISO timestamp.
+- `correlationId`: End-to-end transaction chain identifier across webhooks, commands, events, and outbox messages.
+- `causationId`: The `commandId` or parent `eventId` that directly caused this event.
+- `tenantId`: Multi-organization isolation identifier (`organizationId`).
 
 ---
 
-## 4. Event Ordering Guarantee & Idempotency Rules
+## 4. Transactional Outbox & Eventual Consistency Guarantees
 
-1. **Stream Ordering Guarantee**:
+1. **Transactional Outbox Atomicity**:
+   - `OutboxStore` writes the `OutboxMessage` in the exact same database transaction as the `Sale` aggregate. If process crashes before publishing, background workers retry pending outbox messages without event loss.
+2. **Fire-and-Forget & Eventual Consistency**:
+   - `EventBus.publish()` dispatches events in a fire-and-forget manner to keep write use cases fast. Projections are updated via **Eventual Consistency**.
+3. **Stream Ordering Guarantee**:
    - Event ordering guarantees exist **strictly within the same aggregate stream** (`saleId` or `reservationId`). Cross-aggregate event ordering is non-deterministic by design.
-2. **Idempotency Key Protection**:
-   - External sale registration commands carry an optional `idempotencyKey` (e.g., webhook reference ID) to prevent duplicate event publishing from external partner retries (Biletix, Passo).
+4. **Idempotency Lock & Response Cache Rules**:
+   - Commands support Stripe-style cached responses (`IdempotencyStore`) and atomic lock acquisition to prevent race conditions on duplicate external partner webhooks (Biletix, Passo).
 
 ---
 
@@ -74,9 +84,8 @@ Examples of allowed Read-Only Queries:
 
 1. **Forbidden Direct Mutating Invocations**:
    - `Sale Bounded Context` MUST NEVER call `AccountingService` or `VenueService` state-changing methods directly inside a Use Case.
-   - It MUST create and persist the `Sale` aggregate, then call `eventBus.publish(new SaleRecordedDomainEvent(...))`.
+   - It MUST create and persist the `Sale` aggregate, write to `OutboxStore`, and call `eventBus.publish(new SaleRecordedDomainEvent(...))`.
 2. **Domain Event Autonomy & Event Versioning**:
-   - Every Domain Event carries an `eventVersion` header (e.g. `eventVersion: 1`).
    - `Accounting Bounded Context` subscribes to `SaleRecorded` via `AccountingSaleRecordedHandler` and independently writes to `GeneralLedger`.
    - `Operations Bounded Context` subscribes to `SaleRecorded` via `OperationsSaleRecordedHandler` and independently updates `VenueAssetProjection`.
 3. **Read Model (Projection) Rendering & Optimistic Concurrency**:

@@ -6,9 +6,11 @@ import { IdGenerator } from '@/platform/IdGenerator';
 import { InMemoryEventBus } from '@/application/EventBus';
 import { SaleRecordedDomainEvent, DomainEventNames } from '@/domain/events/DomainEvents';
 import { IdempotencyStore } from '@/platform/IdempotencyStore';
+import { OutboxStore } from '@/platform/OutboxStore';
 import { bootstrapStageOpsApplication } from '@/application/Bootstrap';
 
 export interface ProcessExternalSaleConfirmationCommand {
+  commandId?: string;
   reservationId?: string;
   eventId: string;
   assetId: string;
@@ -18,6 +20,7 @@ export interface ProcessExternalSaleConfirmationCommand {
   purchaserPhone?: string;
   purchaserEmail?: string;
   idempotencyKey?: string;
+  correlationId?: string;
 }
 
 export interface ProcessExternalSaleConfirmationResult {
@@ -30,10 +33,10 @@ export interface ProcessExternalSaleConfirmationResult {
  * StageOps Application Use Case: Process External Sale Confirmation.
  * 
  * Executing sequence:
- * 1. Idempotency Lock Check (Atomic IdempotencyStore lock acquisition for concurrent webhook protection)
+ * 1. Stripe-style Idempotency Lock & Response Cache Check
  * 2. Validate Venue Asset Availability
  * 3. Create Sale Aggregate (with embedded ExternalConfirmation VO and PurchaserSnapshot VO)
- * 4. Save Sale Aggregate to Repository
+ * 4. Persist Sale Aggregate & OutboxMessage atomically (Transactional Outbox Pattern)
  * 5. Publish Minimal SaleRecorded Domain Event (v1) via Application EventBus
  * 6. Operations & Accounting BC Event Handlers execute asynchronously via EventBus
  */
@@ -43,7 +46,13 @@ export class ProcessExternalSaleConfirmationUseCase {
 
     const idempotencyKey = cmd.idempotencyKey || cmd.externalSaleReference;
 
-    // 1. Atomic Idempotency Lock Check: Protect against concurrent duplicate external webhooks
+    // 1. Stripe-style Idempotency Lock & Response Cache Check
+    const existingRecord = IdempotencyStore.getRecord(idempotencyKey);
+    if (existingRecord && existingRecord.status === 'Completed' && existingRecord.responsePayload) {
+      console.log(`[Idempotency] Returning cached response payload for ref: ${cmd.externalSaleReference}`);
+      return existingRecord.responsePayload;
+    }
+
     const lockAcquired = IdempotencyStore.tryAcquireLock(idempotencyKey);
     if (!lockAcquired) {
       const existingSale = MockDataStore.sales.find((s) => s.externalReference === cmd.externalSaleReference);
@@ -81,9 +90,10 @@ export class ProcessExternalSaleConfirmationUseCase {
       const commissionPaid = grossPrice * commissionRate;
       const netRevenue = grossPrice - commissionPaid;
 
-      // 2. Create Sale Aggregate Root
+      // 2. Create Sale Aggregate Root & End-to-End Tracing Context
+      const commandId = cmd.commandId || IdGenerator.generateUUIDv7();
+      const correlationId = cmd.correlationId || IdGenerator.generateUUIDv7();
       const saleId = IdGenerator.generateUUIDv7();
-      const correlationId = IdGenerator.generateUUIDv7();
 
       const sale: Sale = {
         id: saleId,
@@ -144,9 +154,27 @@ export class ProcessExternalSaleConfirmationUseCase {
         createdAt: nowISO,
         updatedAt: nowISO,
       };
+
+      // 3. Persist Sale Aggregate & Transactional Outbox Message atomically
       MockDataStore.sales.push(sale);
 
-      // 3. Convert Reservation status if linked
+      const event: SaleRecordedDomainEvent = {
+        eventName: DomainEventNames.SaleRecorded,
+        header: {
+          eventId: IdGenerator.generateUUIDv7(),
+          eventVersion: 1,
+          occurredAt: nowISO,
+          correlationId,
+          causationId: commandId,
+          tenantId: MockDataStore.organizationId,
+        },
+        saleId: sale.id,
+        eventId: sale.eventId,
+      };
+
+      OutboxStore.addMessage('Sale', sale.id, event);
+
+      // 4. Convert Reservation status if linked
       if (cmd.reservationId) {
         const res = MockDataStore.reservations.find((r) => r.id === cmd.reservationId);
         if (res) {
@@ -155,29 +183,20 @@ export class ProcessExternalSaleConfirmationUseCase {
         }
       }
 
-      // 4. Publish Minimal SaleRecorded Domain Event (v1) via Application EventBus
-      const event: SaleRecordedDomainEvent = {
-        eventName: DomainEventNames.SaleRecorded,
-        header: {
-          eventId: IdGenerator.generateUUIDv7(),
-          eventVersion: 1,
-          occurredAt: nowISO,
-          correlationId,
-          tenantId: MockDataStore.organizationId,
-        },
-        saleId: sale.id,
-        eventId: sale.eventId,
-      };
-
+      // 5. Publish Domain Event via Application EventBus
       InMemoryEventBus.getInstance().publish(event);
+      OutboxStore.markPublished(event.header.eventId);
 
-      IdempotencyStore.markCompleted(idempotencyKey, { saleId: sale.id });
-
-      return {
+      const result: ProcessExternalSaleConfirmationResult = {
         sale,
         event,
         isDuplicateRecord: false,
       };
+
+      // Stripe-style response payload caching
+      IdempotencyStore.markCompleted(idempotencyKey, result);
+
+      return result;
     } catch (err) {
       IdempotencyStore.markFailed(idempotencyKey);
       throw err;

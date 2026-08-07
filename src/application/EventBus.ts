@@ -1,4 +1,4 @@
-import { ConsoleLogger } from '@/platform/Logger';
+import { StructuredJsonLogger } from '@/platform/Logger';
 
 export interface EventHeader {
   eventId: string; // UUID v7
@@ -26,7 +26,7 @@ export interface EventBus {
 export class InMemoryEventBus implements EventBus {
   private static instance: InMemoryEventBus;
   private handlers: Map<string, Set<EventHandler<any>>> = new Map();
-  private logger = ConsoleLogger.getInstance();
+  private logger = StructuredJsonLogger.getInstance();
 
   public static getInstance(): InMemoryEventBus {
     if (!InMemoryEventBus.instance) {
@@ -41,11 +41,13 @@ export class InMemoryEventBus implements EventBus {
       const eventHandlers = this.handlers.get(event.eventName);
       if (eventHandlers) {
         eventHandlers.forEach((handler) => {
-          // Promise.resolve ensures async handlers rejecting promises are caught safely via structured logger
+          // Promise.resolve ensures async handlers rejecting promises are caught safely via StructuredJsonLogger
           Promise.resolve(handler(event)).catch((err) => {
             this.logger.error(`Error executing event handler for ${event.eventName}`, err, {
               eventId: event.header.eventId,
               correlationId: event.header.correlationId,
+              causationId: event.header.causationId,
+              tenantId: event.header.tenantId,
             });
           });
         });
