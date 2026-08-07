@@ -12,6 +12,7 @@ export interface VenueAssetReadModel {
   displayColor: string;
   saleId?: string;
   reservationId?: string;
+  version: number;
   lastUpdated: string;
 }
 
@@ -35,6 +36,7 @@ export class VenueAssetProjection {
         basePrice: asset.pricing.basePrice,
         occupancyState: asset.status === 'Sold' ? 'Satıldı' : asset.status === 'Reserved' ? 'Opsiyonda' : 'Müsait',
         displayColor,
+        version: asset.version || 1,
         lastUpdated: new Date().toISOString(),
       });
     });
@@ -70,6 +72,7 @@ export class VenueAssetProjection {
       displayColor,
       saleId: saleId ?? current.saleId,
       reservationId: reservationId ?? current.reservationId,
+      version: current.version + 1,
       lastUpdated: new Date().toISOString(),
     };
 

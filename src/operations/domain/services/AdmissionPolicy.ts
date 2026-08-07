@@ -12,6 +12,7 @@ export interface AdmissionDecision {
   outcome: AdmissionOutcome;
   code: string;
   message: string;
+  auditReason: 'ADMISSION_SUCCESS' | 'NO_VALID_PURCHASE' | 'CAPACITY_EXCEEDED' | 'RESERVATION_EXPIRED' | 'BLOCKED_CUSTOMER';
   retryAllowed: boolean;
   assetId: string;
 }
@@ -25,6 +26,7 @@ export class AdmissionPolicy {
         outcome: 'Denied',
         code: 'NO_VALID_PURCHASE',
         message: 'Bu alan için geçerli bir satış veya konfirme edilmiş opsiyon bulunamadı.',
+        auditReason: 'NO_VALID_PURCHASE',
         retryAllowed: true,
         assetId,
       };
@@ -35,6 +37,7 @@ export class AdmissionPolicy {
         outcome: 'AlreadyAdmitted',
         code: 'CAPACITY_EXCEEDED',
         message: `Masa kapasitesi doldu (${right.alreadyAdmittedCount}/${right.maxCapacityPax} Pax).`,
+        auditReason: 'CAPACITY_EXCEEDED',
         retryAllowed: false,
         assetId,
       };
@@ -44,6 +47,7 @@ export class AdmissionPolicy {
       outcome: 'Granted',
       code: 'ADMISSION_SUCCESS',
       message: `Kapı girişi onaylandı (${right.purchaserName}).`,
+      auditReason: 'ADMISSION_SUCCESS',
       retryAllowed: false,
       assetId,
     };

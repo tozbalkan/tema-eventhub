@@ -6,9 +6,6 @@ export interface SaleRecordedDomainEvent extends DomainEvent {
   saleId: string;
   eventId: string;
   assetId: string;
-  reservationId?: string;
-  salesChannelId: string;
-  externalReference: string;
 }
 
 export interface ReservationPlacedDomainEvent extends DomainEvent {
@@ -17,7 +14,6 @@ export interface ReservationPlacedDomainEvent extends DomainEvent {
   reservationId: string;
   eventId: string;
   assetId: string;
-  customerName: string;
 }
 
 export interface ReservationConfirmedDomainEvent extends DomainEvent {

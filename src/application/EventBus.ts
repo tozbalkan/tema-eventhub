@@ -14,6 +14,7 @@ export type EventHandler<T extends DomainEvent = DomainEvent> = (event: T) => vo
 export interface EventBus {
   publish(event: DomainEvent): void;
   publishAll(events: DomainEvent[]): void;
+  publishMany(events: DomainEvent[]): void;
   subscribe<T extends DomainEvent>(eventName: string, handler: EventHandler<T>): void;
   unsubscribe<T extends DomainEvent>(eventName: string, handler: EventHandler<T>): void;
 }
@@ -44,6 +45,10 @@ export class InMemoryEventBus implements EventBus {
 
   public publishAll(events: DomainEvent[]): void {
     events.forEach((event) => this.publish(event));
+  }
+
+  public publishMany(events: DomainEvent[]): void {
+    this.publishAll(events);
   }
 
   public subscribe<T extends DomainEvent>(eventName: string, handler: EventHandler<T>): void {

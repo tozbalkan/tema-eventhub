@@ -42,7 +42,7 @@ function setupEventSubscriptions() {
  * 1. Validate Venue Asset Availability
  * 2. Create Sale Aggregate (with embedded ExternalConfirmation VO and PurchaserSnapshot VO)
  * 3. Save Sale Aggregate to Repository
- * 4. Publish SaleRecorded Domain Event (v1) via Application EventBus
+ * 4. Publish Minimal SaleRecorded Domain Event (v1) via Application EventBus
  * 5. Operations & Accounting BC Event Handlers execute asynchronously via EventBus
  */
 export class ProcessExternalSaleConfirmationUseCase {
@@ -142,7 +142,7 @@ export class ProcessExternalSaleConfirmationUseCase {
       }
     }
 
-    // 3. Publish SaleRecorded Domain Event (v1) via Application EventBus
+    // 3. Publish Minimal SaleRecorded Domain Event (v1) via Application EventBus
     const event: SaleRecordedDomainEvent = {
       eventName: 'SaleRecorded',
       header: {
@@ -153,9 +153,6 @@ export class ProcessExternalSaleConfirmationUseCase {
       saleId: sale.id,
       eventId: sale.eventId,
       assetId: cmd.assetId,
-      reservationId: cmd.reservationId,
-      salesChannelId: cmd.salesChannelId,
-      externalReference: cmd.externalSaleReference,
     };
 
     InMemoryEventBus.getInstance().publish(event);
