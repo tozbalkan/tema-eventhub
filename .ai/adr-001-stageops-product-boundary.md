@@ -14,23 +14,28 @@ This Architecture Decision Record (ADR) establishes the **uncompromised product 
 
 ---
 
-## 2. Core Product Axioms (What StageOps IS and IS NOT)
+## 2. Core Product Axioms & Domain Ownership
 
-### What StageOps IS NOT:
-1. **StageOps IS NOT a Ticketing Platform**: It does not issue tickets, manage ticket inventory, or generate QR tokens.
-2. **StageOps IS NOT a Payment Gateway**: It does not collect credit card payments, handle Stripe/iyzico transactions, or execute payment captures.
-3. **StageOps IS NOT a POS Terminal System**: It does not operate credit card readers or cash registers.
-4. **StageOps IS NOT a CRM System**: It does not manage customer profiles, marketing campaigns, or loyalty points.
-5. **StageOps IS NOT an ERP System**: It does not handle corporate general ledger accounting, tax filings, or payroll.
+### StageOps Never Owns (Sistem Dışı Sorumluluklar):
+- **Payment Processing**: No credit card collection, Stripe/iyzico SDKs, or capture workflows.
+- **Ticket Issuing & Inventory**: No ticket token generation, PDF voucher creation, or wallet passes.
+- **QR Code Generation**: No QR code rendering or ticket verification tokens.
+- **Wallet Systems**: No Apple Wallet / Google Wallet pass signing or distribution.
+- **CRM Systems**: No customer profiles, marketing campaigns, or loyalty point tracking.
+- **ERP Systems**: No corporate general ledger accounting, tax filings, or payroll.
+- **Marketing Automation**: No SMS/email campaign execution or push notifications.
 
-### What StageOps IS:
-> **StageOps is a Venue Operations Platform (Mekan Operasyon Platformu).**
-
-Its sole purpose is receiving external business events (e.g. sales confirmations from Biletix, Passo, or Organizer Desks) and managing operational states:
-- Venue layout geometry & asset capacity
-- Operational occupancy projections & seat maps
-- Gate admission rights & real-time entry authorization
-- Double-entry internal revenue splits & event operational logs
+### StageOps Owns (Sistem İçi Sorumluluklar):
+- **Venue Layout & Geometry**: Venue physical layout, seating maps, and zone capacities.
+- **Event Management**: Event scheduling, capacity snapshots, and fire limits.
+- **Venue Assets**: VIP Tables, Bistros, Lounges, Stage, and Bar geometry & status.
+- **Reservation Lifecycle**: Reservation placement, confirmation, expiration, and release.
+- **External Sale Registration**: Receiving confirmed external sale notifications and recording sale ledgers.
+- **Admission Rights & Gate Control**: Real-time venue asset access authorization at VIP gates.
+- **Operations & Occupancy**: Operational seat maps, task queues, and occupancy projections.
+- **Workforce & Staff Assignments**: Gate operator and reception manager assignments.
+- **Operational Timeline Stream**: Chronological event logs for live operations.
+- **Operational Reporting**: Event occupancy, revenue split projections, and gate throughput analytics.
 
 ---
 
