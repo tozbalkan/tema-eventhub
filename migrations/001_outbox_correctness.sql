@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS sales (
   sales_channel_id     VARCHAR(100) NOT NULL,
   external_reference   VARCHAR(100) NOT NULL,
   purchaser_name       VARCHAR(200),
+  purchaser_phone      VARCHAR(50),
+  purchaser_email      VARCHAR(200),
   gross_price          NUMERIC(15,2) NOT NULL,
   commission_paid      NUMERIC(15,2) NOT NULL,
   net_revenue          NUMERIC(15,2) NOT NULL,
@@ -48,6 +50,9 @@ CREATE TABLE IF NOT EXISTS sales (
   status               VARCHAR(30) NOT NULL,
   created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS purchaser_phone VARCHAR(50);
+ALTER TABLE sales ADD COLUMN IF NOT EXISTS purchaser_email VARCHAR(200);
 
 -- Command Idempotency Unique Index (Prevents duplicate Sale creation for same channel + reference)
 CREATE UNIQUE INDEX IF NOT EXISTS ux_sales_external_reference ON sales (sales_channel_id, external_reference);
@@ -83,7 +88,7 @@ CREATE TABLE IF NOT EXISTS accounting_entries (
 DROP INDEX IF EXISTS ux_accounting_source_entry;
 CREATE UNIQUE INDEX ux_accounting_source_entry ON accounting_entries (organization_id, source_type, source_id, entry_type);
 
--- Operations Projections (Business Mutation)
+-- Operations Projections (Business Mutation & Authoritative Asset State Locking)
 CREATE TABLE IF NOT EXISTS venue_asset_projections (
   asset_id         VARCHAR(100) PRIMARY KEY,
   name             VARCHAR(200) NOT NULL,

@@ -12,7 +12,7 @@ import { IdGenerator } from '@/platform/IdGenerator';
 import fs from 'fs';
 import path from 'path';
 
-describe('PostgreSQL Correctness Baseline (T1 - T21 Integration Tests)', () => {
+describe('PostgreSQL Correctness Baseline (T1 - T22 Integration Tests)', () => {
   let pool: Pool;
 
   beforeAll(async () => {
@@ -396,7 +396,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T21 Integration Tests)', () => {
   it('T12: Duplicate Command Idempotency in PostgreSQL mode — Returns duplicate record without creating extra sales', async () => {
     const command = {
       eventId: 'event_gala_2026',
-      assetId: 'asset_vip_a3',
+      assetId: 'asset_bistro_b4',
       salesChannelId: 'biletix',
       externalSaleReference: 'BTX-DUP-TEST-001',
     };
@@ -445,7 +445,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T21 Integration Tests)', () => {
   it('T14: Concurrent Duplicate Commands — 10 parallel commands produce exactly 1 sale row', async () => {
     const command = {
       eventId: 'event_gala_2026',
-      assetId: 'asset_vip_a4',
+      assetId: 'asset_bistro_b1',
       salesChannelId: 'biletix',
       externalSaleReference: 'BTX-RACE-CONCURRENT-001',
     };
@@ -503,7 +503,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T21 Integration Tests)', () => {
   it('T16: Complete Transaction Rollback — Sale, SaleLines & OutboxMessage undone together on error', async () => {
     const command = {
       eventId: 'event_gala_2026',
-      assetId: 'asset_bistro_b1',
+      assetId: 'asset_bistro_b2',
       salesChannelId: 'biletix',
       externalSaleReference: 'BTX-ROLLBACK-TEST-001',
     };
@@ -543,7 +543,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T21 Integration Tests)', () => {
       );
       await tx.query(
         `INSERT INTO sale_lines (id, sale_id, venue_asset_id, quantity, unit_price, total_price)
-         VALUES ($1, $2, 'asset_bistro_b2', 1, 12000, 12000);`,
+         VALUES ($1, $2, 'asset_vip_a4', 1, 25000, 25000);`,
         [IdGenerator.generateUUIDv7(), saleId]
       );
       await PgOutboxStore.addMessage(tx, 'Sale', saleId, event);
@@ -555,7 +555,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T21 Integration Tests)', () => {
     }
 
     const accEntries = await pool.query('SELECT * FROM accounting_entries WHERE source_id = $1', [saleId]);
-    const opsProjections = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', ['asset_bistro_b2']);
+    const opsProjections = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', ['asset_vip_a4']);
 
     const revenueEntries = accEntries.rows.filter((x) => x.entry_type === 'SaleRevenue');
     const commissionEntries = accEntries.rows.filter((x) => x.entry_type === 'PlatformCommission');
@@ -616,7 +616,6 @@ describe('PostgreSQL Correctness Baseline (T1 - T21 Integration Tests)', () => {
       )
     );
 
-    // Attempting to insert same (organization_id, source_type, source_id, entry_type) with eventB throws unique constraint error
     await expect(
       UnitOfWork.execute((tx) =>
         tx.query(
@@ -649,5 +648,33 @@ describe('PostgreSQL Correctness Baseline (T1 - T21 Integration Tests)', () => {
     expect(res2.sale.lines).toHaveLength(1);
     expect(res2.sale.lines[0]?.venueAssetId).toBe('asset_bistro_b3');
     expect(res2.sale.grossPrice).toBe(res1.sale.grossPrice);
+  });
+
+  it('T22: Concurrent Different References Against Same Asset — Zero Overselling Guarantee', async () => {
+    const targetAssetId = 'asset_vip_a3'; // Available VIP Asset
+
+    const tasks = Array.from({ length: 10 }, (_, idx) => {
+      const command = {
+        eventId: 'event_gala_2026',
+        assetId: targetAssetId,
+        salesChannelId: 'biletix',
+        externalSaleReference: `BTX-RACE-DIFF-REF-${idx + 1}`,
+      };
+      return UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+      ).catch((err: Error) => ({ error: err.message }));
+    });
+
+    const results = await Promise.all(tasks);
+
+    const successfulSales = results.filter((r) => 'sale' in r && !r.isDuplicateRecord);
+    const rejectedSales = results.filter((r) => 'error' in r && r.error.includes('SEAT_ALREADY_RESERVED'));
+
+    expect(successfulSales.length).toBe(1);
+    expect(rejectedSales.length).toBe(9);
+
+    // Verify database level total sales containing asset_vip_a3 is EXACTLY 1!
+    const dbLines = await pool.query('SELECT * FROM sale_lines WHERE venue_asset_id = $1', [targetAssetId]);
+    expect(dbLines.rows.length).toBe(1);
   });
 });

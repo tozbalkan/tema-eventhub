@@ -40,9 +40,9 @@ export interface ProcessExternalSaleConfirmationResult {
  * 
  * Executing sequence:
  * 1. Stripe-style Idempotency Lock & Response Cache Check (24h TTL)
- * 2. Validate Venue Asset Availability
- * 3. Create Sale Aggregate
- * 4. Persist Sale Aggregate & OutboxMessage atomically (Transactional Outbox Pattern)
+ * 2. Validate Venue Asset Availability & Database Transaction Locking (FOR UPDATE)
+ * 3. Create Sale Aggregate & Sale Lines
+ * 4. Persist Sale Aggregate, Asset Projection & OutboxMessage atomically (Transactional Outbox Pattern)
  * 5. OutboxPublisherWorker background process dispatches pending events asynchronously
  */
 export class ProcessExternalSaleConfirmationUseCase {
@@ -87,7 +87,11 @@ export class ProcessExternalSaleConfirmationUseCase {
           salesChannelId: row.sales_channel_id,
           externalReference: row.external_reference,
           channel: { type: 'ExternalChannel', name: row.sales_channel_id, reference: row.external_reference },
-          purchaserSnapshot: { fullName: row.purchaser_name || 'VIP Guest', phone: cmd.purchaserPhone || '', email: cmd.purchaserEmail || '' },
+          purchaserSnapshot: {
+            fullName: row.purchaser_name || 'VIP Guest',
+            phone: row.purchaser_phone || cmd.purchaserPhone || '',
+            email: row.purchaser_email || cmd.purchaserEmail || '',
+          },
           saleDate: row.created_at,
           grossPrice: parseFloat(row.gross_price),
           commissionRate: parseFloat(row.gross_price) > 0 ? parseFloat(row.commission_paid) / parseFloat(row.gross_price) : 0,
@@ -117,12 +121,21 @@ export class ProcessExternalSaleConfirmationUseCase {
         };
       }
 
-      // 2. Asset existence and status validation (parity with in-memory path)
+      // 2. Asset existence and status validation
       const asset = VenueService.getAssetById(cmd.assetId);
       if (!asset) {
         throw new Error('Asset not found');
       }
       if (asset.status === 'Sold') {
+        throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
+      }
+
+      // 3. PostgreSQL Database Transaction Lock FOR UPDATE on venue_asset_projections
+      const projLockRes = await client.query(
+        'SELECT status FROM venue_asset_projections WHERE asset_id = $1 FOR UPDATE',
+        [cmd.assetId]
+      );
+      if (projLockRes.rows.length > 0 && projLockRes.rows[0].status === 'Sold') {
         throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
       }
 
@@ -147,7 +160,11 @@ export class ProcessExternalSaleConfirmationUseCase {
         salesChannelId: cmd.salesChannelId,
         externalReference: cmd.externalSaleReference,
         channel: { type: 'ExternalChannel', name: channel.name, reference: cmd.externalSaleReference },
-        purchaserSnapshot: { fullName: cmd.purchaserName || 'Emre Kaya', phone: cmd.purchaserPhone || '+905351234567', email: cmd.purchaserEmail || 'emre@vip.com' },
+        purchaserSnapshot: {
+          fullName: cmd.purchaserName || 'Emre Kaya',
+          phone: cmd.purchaserPhone || '+905351234567',
+          email: cmd.purchaserEmail || 'emre@vip.com',
+        },
         saleDate: nowISO,
         grossPrice,
         commissionRate,
@@ -187,13 +204,13 @@ export class ProcessExternalSaleConfirmationUseCase {
       };
 
       try {
-        // 3. INSERT Sale aggregate into PostgreSQL
+        // 4. INSERT Sale aggregate into PostgreSQL (with purchaser_phone and purchaser_email)
         const saleQuery = `
           INSERT INTO sales (
             id, organization_id, event_id, reservation_id, sales_channel_id,
-            external_reference, purchaser_name, gross_price, commission_paid,
-            net_revenue, currency, status, created_at
-          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13);
+            external_reference, purchaser_name, purchaser_phone, purchaser_email,
+            gross_price, commission_paid, net_revenue, currency, status, created_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15);
         `;
         await client.query(saleQuery, [
           sale.id,
@@ -203,6 +220,8 @@ export class ProcessExternalSaleConfirmationUseCase {
           sale.salesChannelId,
           sale.externalReference,
           sale.purchaserSnapshot?.fullName,
+          sale.purchaserSnapshot?.phone,
+          sale.purchaserSnapshot?.email,
           sale.grossPrice,
           sale.commissionPaid,
           sale.netRevenue,
@@ -211,14 +230,32 @@ export class ProcessExternalSaleConfirmationUseCase {
           nowISO,
         ]);
 
-        // 4. INSERT Sale lines into PostgreSQL in SAME transaction!
+        // 5. INSERT Sale lines into PostgreSQL in SAME transaction!
         const lineQuery = `
           INSERT INTO sale_lines (id, sale_id, venue_asset_id, quantity, unit_price, total_price)
           VALUES ($1, $2, $3, 1, $4, $4);
         `;
         await client.query(lineQuery, [lineId, sale.id, cmd.assetId, grossPrice]);
 
-        // 5. INSERT OutboxMessage into PostgreSQL in SAME transaction!
+        // 6. Lock venue_asset_projections status to Sold in SAME transaction with ON CONFLICT status check
+        const lockAssetQuery = `
+          INSERT INTO venue_asset_projections (
+            asset_id, name, category, status, occupancy_state, sale_id, reservation_id, pax_capacity, base_price, version, last_updated
+          ) VALUES ($1, $2, 'VIP', 'Sold', 'Occupied', $3, $4, 6, $5, 1, NOW())
+          ON CONFLICT (asset_id) DO UPDATE SET
+            status = CASE WHEN venue_asset_projections.status = 'Sold' THEN 'ALREADY_SOLD_ERROR' ELSE 'Sold' END,
+            occupancy_state = 'Occupied',
+            sale_id = EXCLUDED.sale_id,
+            version = venue_asset_projections.version + 1,
+            last_updated = NOW()
+          RETURNING status;
+        `;
+        const lockRes = await client.query(lockAssetQuery, [cmd.assetId, asset.name, sale.id, sale.reservationId, grossPrice]);
+        if (lockRes.rows.length > 0 && lockRes.rows[0].status === 'ALREADY_SOLD_ERROR') {
+          throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
+        }
+
+        // 7. INSERT OutboxMessage into PostgreSQL in SAME transaction!
         const event: SaleRecordedDomainEvent = {
           eventName: DomainEventNames.SaleRecorded,
           header: {
@@ -243,8 +280,8 @@ export class ProcessExternalSaleConfirmationUseCase {
           isDuplicateRecord: false,
         };
       } catch (err: any) {
-        // Catch PostgreSQL 23505 unique violation on ux_sales_external_reference
-        if (err.code === '23505' || (err.message && err.message.includes('ux_sales_external_reference'))) {
+        // Explicitly catch PostgreSQL 23505 unique violation on ux_sales_external_reference
+        if (err.code === '23505' && (err.constraint === 'ux_sales_external_reference' || (err.message && err.message.includes('ux_sales_external_reference')))) {
           const pool = PgPool.getPool();
           const fetchExisting = await pool.query(
             'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
@@ -274,6 +311,11 @@ export class ProcessExternalSaleConfirmationUseCase {
                 grossPrice: parseFloat(row.gross_price),
                 commissionPaid: parseFloat(row.commission_paid),
                 netRevenue: parseFloat(row.net_revenue),
+                purchaserSnapshot: {
+                  fullName: row.purchaser_name || 'VIP Guest',
+                  phone: row.purchaser_phone || cmd.purchaserPhone || '',
+                  email: row.purchaser_email || cmd.purchaserEmail || '',
+                },
                 lines,
               },
               isDuplicateRecord: true,
