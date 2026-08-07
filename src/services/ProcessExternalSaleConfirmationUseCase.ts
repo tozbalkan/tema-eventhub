@@ -237,21 +237,21 @@ export class ProcessExternalSaleConfirmationUseCase {
         `;
         await client.query(lineQuery, [lineId, sale.id, cmd.assetId, grossPrice]);
 
-        // 6. Lock venue_asset_projections status to Sold in SAME transaction with ON CONFLICT status check
+        // 6. Lock venue_asset_projections status to Sold in SAME transaction with WHERE status <> 'Sold' predicate
         const lockAssetQuery = `
           INSERT INTO venue_asset_projections (
             asset_id, name, category, status, occupancy_state, sale_id, reservation_id, pax_capacity, base_price, version, last_updated
           ) VALUES ($1, $2, 'VIP', 'Sold', 'Occupied', $3, $4, 6, $5, 1, NOW())
           ON CONFLICT (asset_id) DO UPDATE SET
-            status = CASE WHEN venue_asset_projections.status = 'Sold' THEN 'ALREADY_SOLD_ERROR' ELSE 'Sold' END,
+            status = 'Sold',
             occupancy_state = 'Occupied',
             sale_id = EXCLUDED.sale_id,
             version = venue_asset_projections.version + 1,
             last_updated = NOW()
-          RETURNING status;
+          WHERE venue_asset_projections.status <> 'Sold';
         `;
         const lockRes = await client.query(lockAssetQuery, [cmd.assetId, asset.name, sale.id, sale.reservationId, grossPrice]);
-        if (lockRes.rows.length > 0 && lockRes.rows[0].status === 'ALREADY_SOLD_ERROR') {
+        if (lockRes.rowCount === 0) {
           throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
         }
 

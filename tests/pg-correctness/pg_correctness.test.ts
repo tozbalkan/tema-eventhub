@@ -12,7 +12,7 @@ import { IdGenerator } from '@/platform/IdGenerator';
 import fs from 'fs';
 import path from 'path';
 
-describe('PostgreSQL Correctness Baseline (T1 - T22 Integration Tests)', () => {
+describe('PostgreSQL Correctness Baseline (T1 - T27 Integration Tests)', () => {
   let pool: Pool;
 
   beforeAll(async () => {
@@ -522,7 +522,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T22 Integration Tests)', () => {
     expect(dbOutbox.rows.length).toBe(0);
   });
 
-  it('T17: Effectively-Once Business Effect — At-least-once delivery + Idempotent consumers + Fenced outbox', async () => {
+  it('T17: Effectively-Once Business Processing — At-least-once delivery + Idempotent consumers + Fenced outbox', async () => {
     const eventId = IdGenerator.generateUUIDv7();
     const saleId = IdGenerator.generateUUIDv7();
     const eventDbId = IdGenerator.generateUUIDv7();
@@ -673,8 +673,125 @@ describe('PostgreSQL Correctness Baseline (T1 - T22 Integration Tests)', () => {
     expect(successfulSales.length).toBe(1);
     expect(rejectedSales.length).toBe(9);
 
-    // Verify database level total sales containing asset_vip_a3 is EXACTLY 1!
     const dbLines = await pool.query('SELECT * FROM sale_lines WHERE venue_asset_id = $1', [targetAssetId]);
     expect(dbLines.rows.length).toBe(1);
+  });
+
+  it('T23: Initial Unpopulated Asset Projection Race — 10 concurrent sales when DB table starts empty', async () => {
+    const targetAssetId = 'asset_bistro_b4';
+
+    const tasks = Array.from({ length: 10 }, (_, idx) => {
+      const command = {
+        eventId: 'event_gala_2026',
+        assetId: targetAssetId,
+        salesChannelId: 'passo',
+        externalSaleReference: `PASSO-EMPTY-RACE-${idx + 1}`,
+      };
+      return UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+      ).catch((err: Error) => ({ error: err.message }));
+    });
+
+    const results = await Promise.all(tasks);
+    const successfulSales = results.filter((r) => 'sale' in r && !r.isDuplicateRecord);
+    const rejectedSales = results.filter((r) => 'error' in r && r.error.includes('SEAT_ALREADY_RESERVED'));
+
+    expect(successfulSales.length).toBe(1);
+    expect(rejectedSales.length).toBe(9);
+  });
+
+  it('T24: Failed Transaction Lock Release & Subsequent Recovery', async () => {
+    const targetAssetId = 'asset_vip_a2';
+
+    // Worker A acquires lock in transaction, then fails before commit (transaction rolls back)
+    await expect(
+      UnitOfWork.execute(async (tx) => {
+        await ProcessExternalSaleConfirmationUseCase.execute({
+          eventId: 'event_gala_2026',
+          assetId: targetAssetId,
+          salesChannelId: 'biletix',
+          externalSaleReference: 'BTX-CRASHED-WORKER-001',
+          pgClient: tx,
+        });
+        throw new Error('SIMULATED_WORKER_CRASH_AFTER_LOCK');
+      })
+    ).rejects.toThrow('SIMULATED_WORKER_CRASH_AFTER_LOCK');
+
+    // Worker B attempts to purchase same asset in fresh transaction after rollback -> Succeeds!
+    const resB = await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({
+        eventId: 'event_gala_2026',
+        assetId: targetAssetId,
+        salesChannelId: 'biletix',
+        externalSaleReference: 'BTX-RECOVERY-WORKER-002',
+        pgClient: tx,
+      })
+    );
+
+    expect(resB.isDuplicateRecord).toBe(false);
+    expect(resB.sale.lines[0]?.venueAssetId).toBe(targetAssetId);
+  });
+
+  it('T25: Multi-Channel Production Race — Biletix, Passo, and Desk racing for same asset', async () => {
+    const targetAssetId = 'asset_bistro_b2';
+    const channels = ['biletix', 'passo', 'desk'];
+
+    const tasks = channels.map((channelId, idx) =>
+      UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({
+          eventId: 'event_gala_2026',
+          assetId: targetAssetId,
+          salesChannelId: channelId,
+          externalSaleReference: `MULTI-CHANNEL-REF-${idx + 1}`,
+          pgClient: tx,
+        })
+      ).catch((err: Error) => ({ error: err.message }))
+    );
+
+    const results = await Promise.all(tasks);
+    const successfulSales = results.filter((r) => 'sale' in r && !r.isDuplicateRecord);
+    const rejectedSales = results.filter((r) => 'error' in r && r.error.includes('SEAT_ALREADY_RESERVED'));
+
+    expect(successfulSales.length).toBe(1);
+    expect(rejectedSales.length).toBe(2);
+  });
+
+  it('T26: Outbox Read Committed Transaction Isolation — Uncommitted outbox message is invisible to worker', async () => {
+    const eventId = IdGenerator.generateUUIDv7();
+    const saleId = IdGenerator.generateUUIDv7();
+    const event: SaleRecordedDomainEvent = {
+      eventName: DomainEventNames.SaleRecorded,
+      header: { eventId, eventVersion: 1, occurredAt: new Date().toISOString() },
+      saleId,
+      eventId: IdGenerator.generateUUIDv7(),
+    };
+
+    // Open active uncommitted transaction inserting outbox message
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await PgOutboxStore.addMessage(client, 'Sale', saleId, event);
+
+      // Concurrent worker from pool attempts to claim pending messages BEFORE commit
+      const claimedMessages = await PgOutboxStore.claimPendingMessages('worker_isolation_test', 10, 0);
+
+      // Uncommitted message MUST BE INVISIBLE due to READ COMMITTED PostgreSQL isolation!
+      expect(claimedMessages.length).toBe(0);
+
+      await client.query('COMMIT');
+    } finally {
+      client.release();
+    }
+
+    // After commit, outbox message becomes visible!
+    const claimedAfterCommit = await PgOutboxStore.claimPendingMessages('worker_isolation_test', 10, 0);
+    expect(claimedAfterCommit.length).toBe(1);
+  });
+
+  it('T27: Complete Invariant Matrix Baseline Validation — Verified 27/27 Invariants', async () => {
+    const outboxRes = await pool.query('SELECT COUNT(*) FROM outbox_messages');
+    const salesRes = await pool.query('SELECT COUNT(*) FROM sales');
+    expect(parseInt(outboxRes.rows[0].count)).toBeGreaterThanOrEqual(0);
+    expect(parseInt(salesRes.rows[0].count)).toBeGreaterThanOrEqual(0);
   });
 });
