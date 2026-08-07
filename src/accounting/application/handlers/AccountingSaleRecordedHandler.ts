@@ -14,7 +14,10 @@ export class AccountingSaleRecordedHandler {
     }
 
     const sale = MockDataStore.sales.find((s) => s.id === event.saleId);
-    if (!sale) return;
+    if (!sale) {
+      // Throw to trigger Outbox retry — silent return would mark event as Published and lose it
+      throw new Error(`[${CONSUMER_NAME}] Sale ${event.saleId} not found. Event will be retried via Outbox backoff.`);
+    }
 
     const accRevenue: AccountingEntry = {
       id: IdGenerator.generateUUIDv7(),

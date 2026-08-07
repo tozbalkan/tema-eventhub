@@ -37,7 +37,7 @@ Inter-Bounded Context state-mutating communication MUST occur exclusively throug
        Eventual Consistency
 ```
 
-*Architectural Principle*: StageOps **DOES NOT** claim "Exactly-Once Delivery". Exactly-once is impossible in distributed systems. StageOps guarantees **At-Least-Once Delivery + Idempotent Consumers = Eventual Consistency**.
+*Architectural Principle*: StageOps does not rely on exactly-once delivery semantics. End-to-end exactly-once side effects are not assumed. Duplicate delivery is expected and correctness is achieved through idempotent consumers and transactional state changes. **We don't need exactly-once delivery to guarantee correct business effects.**
 
 ---
 
@@ -133,6 +133,8 @@ Each consumer checks `ConsumerIdempotencyStore.isAlreadyProcessed(eventId, consu
 
 In production: `UNIQUE(event_id, consumer_name)` constraint in PostgreSQL.
 
+> **IMPORTANT: Atomicity Gap (P0)**. The current `isAlreadyProcessed()` + business mutation + `markProcessed()` sequence is NOT atomic. In production, the idempotency check and business mutation MUST occur within a single database transaction (`BEGIN → INSERT processed_event ON CONFLICT DO NOTHING → IF inserted: business mutation → COMMIT`). Without this, a process crash between business mutation and `markProcessed()` will cause duplicate side effects on redelivery.
+
 ---
 
 ## 7. CQRS Read-Only Query Exception
@@ -162,7 +164,7 @@ Domain event payloads MUST be **JSON-serializable only**. No `Date`, `Map`, `Set
 | Outbox persistence | ⚠️ In-memory array | PostgreSQL table |
 | Outbox transaction | ⚠️ Logical (two array pushes) | Single DB transaction |
 | Worker leasing | ⚠️ In-process reference | `SELECT ... FOR UPDATE SKIP LOCKED` |
-| Consumer idempotency | ⚠️ In-memory Map | `UNIQUE(event_id, consumer_name)` |
+| Consumer idempotency | ⚠️ In-memory Map, non-atomic | `UNIQUE(event_id, consumer_name)` + same-txn |
 | Idempotency store | ⚠️ In-memory Map | Redis `SET NX PX` / PostgreSQL |
 | Retry + backoff + jitter | ✅ Implemented | — |
 | Dead Letter Queue | ✅ Implemented | DLQ persistence + replay |
@@ -174,6 +176,6 @@ Domain event payloads MUST be **JSON-serializable only**. No `Date`, `Map`, `Set
 ## 10. Consequences & Benefits
 
 - **Zero Cascading Failures**: A failure in Accounting or Reporting handlers will never break the primary Sale registration transaction.
-- **Microservices Ready**: Moving a Bounded Context out into an independent microservice requires zero changes to the `Sale` domain logic — only swapping the `InMemoryEventBus` for a message broker adapter.
+- **Transport-Independent Domain Logic**: Bounded Context domain and application logic is designed to remain independent of the transport mechanism. Extracting a context into an independent microservice primarily requires infrastructure and deployment changes (broker adapter, serialization, durable consumer idempotency, observability) rather than redesigning its domain communication model.
 - **Parallel Team Velocity**: Autonomous teams can build new listeners (e.g. VIP SMS Notification Handler, Analytics Handler) without touching core codebase.
 - **Duplicate Safety**: Consumer idempotency guarantees correct results even under At-Least-Once delivery.

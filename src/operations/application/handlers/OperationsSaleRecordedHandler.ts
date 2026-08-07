@@ -15,7 +15,10 @@ export class OperationsSaleRecordedHandler {
     }
 
     const sale = MockDataStore.sales.find((s) => s.id === event.saleId);
-    if (!sale) return;
+    if (!sale) {
+      // Throw to trigger Outbox retry — silent return would mark event as Published and lose it
+      throw new Error(`[${CONSUMER_NAME}] Sale ${event.saleId} not found. Event will be retried via Outbox backoff.`);
+    }
 
     // Support multi-asset sales natively by reading lines from Sale aggregate
     sale.lines.forEach((line) => {
