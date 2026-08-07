@@ -3,10 +3,10 @@ import { Sale } from '@/types/sale';
 import { SalesChannel } from '@/types/sales-channel';
 import { VenueService } from './VenueService';
 import { IdGenerator } from '@/platform/IdGenerator';
-import { InMemoryEventBus } from '@/application/EventBus';
 import { SaleRecordedDomainEvent, DomainEventNames } from '@/domain/events/DomainEvents';
 import { IdempotencyStore } from '@/platform/IdempotencyStore';
 import { OutboxStore } from '@/platform/OutboxStore';
+import { OutboxPublisherWorker } from '@/platform/OutboxPublisherWorker';
 import { bootstrapStageOpsApplication } from '@/application/Bootstrap';
 
 export interface ProcessExternalSaleConfirmationCommand {
@@ -21,6 +21,8 @@ export interface ProcessExternalSaleConfirmationCommand {
   purchaserEmail?: string;
   idempotencyKey?: string;
   correlationId?: string;
+  traceId?: string;
+  spanId?: string;
 }
 
 export interface ProcessExternalSaleConfirmationResult {
@@ -33,15 +35,14 @@ export interface ProcessExternalSaleConfirmationResult {
  * StageOps Application Use Case: Process External Sale Confirmation.
  * 
  * Executing sequence:
- * 1. Stripe-style Idempotency Lock & Response Cache Check
+ * 1. Stripe-style Idempotency Lock & Response Cache Check (24h TTL)
  * 2. Validate Venue Asset Availability
  * 3. Create Sale Aggregate (with embedded ExternalConfirmation VO and PurchaserSnapshot VO)
  * 4. Persist Sale Aggregate & OutboxMessage atomically (Transactional Outbox Pattern)
- * 5. Publish Minimal SaleRecorded Domain Event (v1) via Application EventBus
- * 6. Operations & Accounting BC Event Handlers execute asynchronously via EventBus
+ * 5. OutboxPublisherWorker background process dispatches pending events asynchronously
  */
 export class ProcessExternalSaleConfirmationUseCase {
-  public static execute(cmd: ProcessExternalSaleConfirmationCommand): ProcessExternalSaleConfirmationResult {
+  public static async execute(cmd: ProcessExternalSaleConfirmationCommand): Promise<ProcessExternalSaleConfirmationResult> {
     bootstrapStageOpsApplication();
 
     const idempotencyKey = cmd.idempotencyKey || cmd.externalSaleReference;
@@ -167,6 +168,8 @@ export class ProcessExternalSaleConfirmationUseCase {
           correlationId,
           causationId: commandId,
           tenantId: MockDataStore.organizationId,
+          traceId: cmd.traceId,
+          spanId: cmd.spanId,
         },
         saleId: sale.id,
         eventId: sale.eventId,
@@ -183,9 +186,8 @@ export class ProcessExternalSaleConfirmationUseCase {
         }
       }
 
-      // 5. Publish Domain Event via Application EventBus
-      InMemoryEventBus.getInstance().publish(event);
-      OutboxStore.markPublished(event.header.eventId);
+      // 5. Asynchronous OutboxPublisherWorker Background Dispatch
+      await OutboxPublisherWorker.processPendingMessages();
 
       const result: ProcessExternalSaleConfirmationResult = {
         sale,

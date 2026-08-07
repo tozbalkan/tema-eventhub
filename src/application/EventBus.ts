@@ -1,24 +1,26 @@
 import { StructuredJsonLogger } from '@/platform/Logger';
 
 export interface EventHeader {
-  eventId: string; // UUID v7
-  eventVersion: number; // e.g. 1
-  occurredAt: string; // ISO string
-  correlationId?: string;
-  causationId?: string;
-  tenantId?: string;
+  readonly eventId: string; // UUID v7
+  readonly eventVersion: number; // e.g. 1
+  readonly occurredAt: string; // ISO string
+  readonly correlationId?: string;
+  readonly causationId?: string;
+  readonly tenantId?: string;
+  readonly traceId?: string;
+  readonly spanId?: string;
 }
 
 export interface DomainEvent {
-  eventName: string;
-  header: EventHeader;
+  readonly eventName: string;
+  readonly header: EventHeader;
 }
 
-export type EventHandler<T extends DomainEvent = DomainEvent> = (event: T) => void | Promise<void>;
+export type EventHandler<T extends DomainEvent = DomainEvent> = (event: Readonly<T>) => void | Promise<void>;
 
 export interface EventBus {
-  publish(event: DomainEvent): void;
-  publish(events: readonly DomainEvent[]): void;
+  publish(event: DomainEvent): Promise<void>;
+  publish(events: readonly DomainEvent[]): Promise<void>;
   subscribe<T extends DomainEvent>(eventName: string, handler: EventHandler<T>): void;
   unsubscribe<T extends DomainEvent>(eventName: string, handler: EventHandler<T>): void;
 }
@@ -35,24 +37,26 @@ export class InMemoryEventBus implements EventBus {
     return InMemoryEventBus.instance;
   }
 
-  public publish(eventOrEvents: DomainEvent | readonly DomainEvent[]): void {
+  public async publish(eventOrEvents: DomainEvent | readonly DomainEvent[]): Promise<void> {
     const events = Array.isArray(eventOrEvents) ? eventOrEvents : [eventOrEvents];
-    events.forEach((event) => {
+    
+    for (const event of events) {
       const eventHandlers = this.handlers.get(event.eventName);
       if (eventHandlers) {
-        eventHandlers.forEach((handler) => {
-          // Promise.resolve ensures async handlers rejecting promises are caught safely via StructuredJsonLogger
-          Promise.resolve(handler(event)).catch((err) => {
+        const promises = Array.from(eventHandlers).map((handler) =>
+          Promise.resolve(handler(Object.freeze(event))).catch((err) => {
             this.logger.error(`Error executing event handler for ${event.eventName}`, err, {
               eventId: event.header.eventId,
               correlationId: event.header.correlationId,
               causationId: event.header.causationId,
               tenantId: event.header.tenantId,
+              traceId: event.header.traceId,
             });
-          });
-        });
+          })
+        );
+        await Promise.all(promises);
       }
-    });
+    }
   }
 
   public subscribe<T extends DomainEvent>(eventName: string, handler: EventHandler<T>): void {

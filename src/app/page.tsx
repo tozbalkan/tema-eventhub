@@ -155,13 +155,13 @@ export default function OperationalWorkspaceDesk() {
     }
   };
 
-  const handleProcessExternalSaleConfirmation = () => {
+  const handleProcessExternalSaleConfirmation = async () => {
     if (!selectedAssetReadModel) return;
 
     try {
       const ref = `BTX-20260807-${Math.floor(10000 + Math.random() * 90000)}`;
-      // Execute ProcessExternalSaleConfirmationUseCase Application Use Case
-      const result = ProcessExternalSaleConfirmationUseCase.execute({
+      // Execute ProcessExternalSaleConfirmationUseCase Application Use Case asynchronously
+      const result = await ProcessExternalSaleConfirmationUseCase.execute({
         eventId: MockDataStore.event.id,
         assetId: selectedAssetReadModel.assetId,
         salesChannelId: 'biletix',
@@ -178,7 +178,7 @@ export default function OperationalWorkspaceDesk() {
         );
       } else {
         addTimeline(
-          `✓ SaleRecorded Event (v1) Yayınlandı: ${selectedAssetReadModel.name}`,
+          `✓ SaleRecorded Outbox & Event (v1) Yayınlandı: ${selectedAssetReadModel.name}`,
           `Kanal: Biletix | Ref: ${ref} | Net Hakediş: ₺${result.sale.netRevenue.toLocaleString('tr-TR')}`
         );
       }
@@ -558,7 +558,7 @@ export default function OperationalWorkspaceDesk() {
           </div>
 
           <p className={textSubtleSm}>
-            Dış kanaldan gelen satışı StageOps operasyon defterine işler. Sırasıyla: SaleRecorded Event (v1) ➔ Operations & Accounting Handlers ➔ VenueAssetProjection Güncellemesi gerçekleşir.
+            Dış kanaldan gelen satışı StageOps operasyon defterine işler. Sırasıyla: OutboxStore.addMessage() ➔ OutboxPublisherWorker ➔ Operations & Accounting Handlers ➔ VenueAssetProjection Güncellemesi gerçekleşir.
           </p>
 
           <Button variant="primary" onClick={handleProcessExternalSaleConfirmation}>

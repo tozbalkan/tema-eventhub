@@ -12,63 +12,63 @@ export const DomainEventNames = {
 } as const;
 
 export interface SaleRecordedDomainEvent extends DomainEvent {
-  eventName: typeof DomainEventNames.SaleRecorded;
-  header: EventHeader;
-  saleId: string;
-  eventId: string;
+  readonly eventName: typeof DomainEventNames.SaleRecorded;
+  readonly header: EventHeader;
+  readonly saleId: string;
+  readonly eventId: string;
 }
 
 export interface ReservationPlacedDomainEvent extends DomainEvent {
-  eventName: typeof DomainEventNames.ReservationPlaced;
-  header: EventHeader;
-  reservationId: string;
-  eventId: string;
-  assetId: string;
+  readonly eventName: typeof DomainEventNames.ReservationPlaced;
+  readonly header: EventHeader;
+  readonly reservationId: string;
+  readonly eventId: string;
+  readonly assetId: string;
 }
 
 export interface ReservationConfirmedDomainEvent extends DomainEvent {
-  eventName: typeof DomainEventNames.ReservationConfirmed;
-  header: EventHeader;
-  reservationId: string;
-  eventId: string;
-  assetId: string;
+  readonly eventName: typeof DomainEventNames.ReservationConfirmed;
+  readonly header: EventHeader;
+  readonly reservationId: string;
+  readonly eventId: string;
+  readonly assetId: string;
 }
 
 export interface ReservationExpiredDomainEvent extends DomainEvent {
-  eventName: typeof DomainEventNames.ReservationExpired;
-  header: EventHeader;
-  reservationId: string;
-  assetId: string;
+  readonly eventName: typeof DomainEventNames.ReservationExpired;
+  readonly header: EventHeader;
+  readonly reservationId: string;
+  readonly assetId: string;
 }
 
 export interface ReservationReleasedDomainEvent extends DomainEvent {
-  eventName: typeof DomainEventNames.ReservationReleased;
-  header: EventHeader;
-  reservationId: string;
-  assetId: string;
+  readonly eventName: typeof DomainEventNames.ReservationReleased;
+  readonly header: EventHeader;
+  readonly reservationId: string;
+  readonly assetId: string;
 }
 
 export interface ReservationCancelledDomainEvent extends DomainEvent {
-  eventName: typeof DomainEventNames.ReservationCancelled;
-  header: EventHeader;
-  reservationId: string;
-  assetId: string;
+  readonly eventName: typeof DomainEventNames.ReservationCancelled;
+  readonly header: EventHeader;
+  readonly reservationId: string;
+  readonly assetId: string;
 }
 
 export interface ReservationConvertedToSaleDomainEvent extends DomainEvent {
-  eventName: typeof DomainEventNames.ReservationConvertedToSale;
-  header: EventHeader;
-  reservationId: string;
-  saleId: string;
-  assetId: string;
+  readonly eventName: typeof DomainEventNames.ReservationConvertedToSale;
+  readonly header: EventHeader;
+  readonly reservationId: string;
+  readonly saleId: string;
+  readonly assetId: string;
 }
 
 export interface AdmissionRecordedDomainEvent extends DomainEvent {
-  eventName: typeof DomainEventNames.AdmissionRecorded;
-  header: EventHeader;
-  admissionId: string;
-  saleId?: string;
-  assetId: string;
-  gateId: string;
-  result: 'Granted' | 'Denied' | 'AlreadyAdmitted' | 'ReservationExpired' | 'WrongVenue' | 'Blocked';
+  readonly eventName: typeof DomainEventNames.AdmissionRecorded;
+  readonly header: EventHeader;
+  readonly admissionId: string;
+  readonly saleId?: string;
+  readonly assetId: string;
+  readonly gateId: string;
+  readonly result: 'Granted' | 'Denied' | 'AlreadyAdmitted' | 'ReservationExpired' | 'WrongVenue' | 'Blocked';
 }
