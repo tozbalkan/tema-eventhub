@@ -4,7 +4,7 @@ import { VenueAsset } from '@/types/venue-asset';
 import { Reservation } from '@/types/reservation';
 import { Sale } from '@/types/sale';
 import { AccountingEntry } from '@/types/accounting-entry';
-import { ReservationTicket, CheckIn } from '@/types/ticket';
+import { CheckIn } from '@/types/check-in';
 import { Customer } from '@/types/customer';
 import { SalesChannel } from '@/types/sales-channel';
 
@@ -368,7 +368,7 @@ export class MockDataStore {
         {
           id: 'sline_01',
           saleId: 'sale_a1_01',
-          itemType: 'Ticket',
+          itemType: 'VenueAsset',
           venueAssetId: 'asset_vip_a1',
           quantity: 1,
           unitPrice: 25000,
@@ -423,29 +423,15 @@ export class MockDataStore {
     },
   ];
 
-  public static tickets: ReservationTicket[] = [
-    {
-      id: 'tkt_a1_01',
-      organizationId: MockDataStore.organizationId,
-      reservationId: 'res_a1_fake',
-      saleId: 'sale_a1_01',
-      venueAssetId: 'asset_vip_a1',
-      token: 'TKT_VIP_A1_987654',
-      status: 'Active',
-      version: 1,
-      expiresAt: '2026-08-16T05:00:00Z',
-      createdAt: '2026-08-03T16:30:00Z',
-    },
-  ];
-
   public static checkIns: CheckIn[] = [
     {
       id: 'chk_01',
       organizationId: MockDataStore.organizationId,
       eventId: MockDataStore.event.id,
-      reservationId: 'res_a1_fake',
-      ticketId: 'tkt_a1_01',
+      venueAssetId: 'asset_vip_a1',
+      saleId: 'sale_a1_01',
       gateId: 'gate_vip_north',
+      guestName: 'Tarık Özbalkan',
       checkedInAt: '2026-08-15T21:30:00Z',
       checkedInBy: 'Kapı Görevlisi Mehmet',
       status: 'Completed',

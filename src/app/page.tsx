@@ -4,13 +4,13 @@ import React, { useState } from 'react';
 import { 
   UserCheck, 
   Sparkles,
-  QrCode,
   RefreshCw,
   ChevronDown,
   ChevronUp,
   Clock,
   CheckCircle2,
-  Layers
+  Layers,
+  ShieldCheck
 } from 'lucide-react';
 import { Button } from '@/components/ui/Button/Button';
 import { Badge } from '@/components/ui/Badge/Badge';
@@ -101,11 +101,10 @@ export default function OperationalWorkspaceDesk() {
 
   // Canlı İşlem Zaman Çizelgesi
   const [timeline, setTimeline] = useState<TimelineLog[]>([
-    { time: '17:42', title: '✓ Biletix Satış Bildirimi İşlendi', sub: 'Ref: BTX-20260807-18291 (Net: ₺23.500)' },
-    { time: '17:40', title: '✓ Satış Kanalı Doğrulandı', sub: 'Kanal: Biletix' },
-    { time: '17:39', title: '✓ Bilet Düzenlendi', sub: 'Token: VIP_A1_87F4A0B2' },
-    { time: '17:38', title: '✓ Opsiyon Oluşturuldu', sub: 'Selin Yılmaz (VIP Masa A2)' },
-    { time: '17:30', title: '✓ Kapı Girişi Doğrulandı', sub: 'VIP Kuzey Kapısı (Mehmet Y.)' },
+    { time: '17:42', title: '✓ Satış Bildirimi İşlendi', sub: 'Biletix (Ref: BTX-20260807-18291) - Net: ₺23.500' },
+    { time: '17:40', title: '✓ SaleRegistered Event Yayınlandı', sub: 'Event Bus (External CRM & Wallet Notification)' },
+    { time: '17:38', title: '✓ Opsiyon Tanımlandı', sub: 'Selin Yılmaz (VIP Masa A2)' },
+    { time: '17:30', title: '✓ Kapı Girişi Doğrulandı', sub: 'VIP Kuzey Kapısı (Tarık Özbalkan)' },
   ]);
 
   const toggleAccordion = (key: keyof typeof accordionState) => {
@@ -161,8 +160,8 @@ export default function OperationalWorkspaceDesk() {
       });
 
       addTimeline(
-        `✓ Dış Satış Bildirimi İşlendi: ${selectedAsset.name}`,
-        `Kanal: Biletix | Ref: ${ref} | Net Hakediş: ₺${result.sale.netRevenue.toLocaleString('tr-TR')} (Bilet Token: ${result.ticket.token})`
+        `✓ Satış Kaydı Oluşturuldu: ${selectedAsset.name}`,
+        `Kanal: Biletix | Ref: ${ref} | Net Hakediş: ₺${result.sale.netRevenue.toLocaleString('tr-TR')} | Event: SaleRegistered`
       );
 
       setIsSaleModalOpen(false);
@@ -183,26 +182,23 @@ export default function OperationalWorkspaceDesk() {
   };
 
   const handleCheckIn = () => {
-    const activeTicket = MockDataStore.tickets.find((t) => t.status === 'Active');
-    if (!activeTicket) {
-      alert('Giriş simülasyonu için aktif bilet bulunamadı! Önce dış sistem satış bildirimini işleyin.');
-      return;
-    }
-
-    activeTicket.status = 'CheckedIn';
+    if (!selectedAsset) return;
+    const activeSale = MockDataStore.sales.find((s) => s.lines.some((l) => l.venueAssetId === selectedAsset.id));
+    
     MockDataStore.checkIns.push({
       id: `chk_${Date.now()}`,
       organizationId: MockDataStore.organizationId,
       eventId: MockDataStore.event.id,
-      reservationId: activeTicket.reservationId,
-      ticketId: activeTicket.id,
+      venueAssetId: selectedAsset.id,
+      saleId: activeSale?.id,
       gateId: MockDataStore.gates[0]?.id || 'gate_vip_north',
+      guestName: 'Tarık Özbalkan',
       checkedInAt: new Date().toISOString(),
       checkedInBy: 'VIP Kapı Görevlisi',
       status: 'Completed',
     });
 
-    addTimeline(`✓ Kapı Girişi Onaylandı`, `Bilet ${activeTicket.id} VIP Kuzey Kapısından Taptırıldı`);
+    addTimeline(`✓ Kapı Girişi Doğrulandı`, `${selectedAsset.name} VIP Kuzey Kapısından Giriş Yaptı`);
     setIsCheckInModalOpen(false);
     refreshData();
   };
@@ -244,7 +240,7 @@ export default function OperationalWorkspaceDesk() {
             <div>
               <h2 className={floorPlanTitle}>Canlı Oturma Haritası</h2>
               <p className={floorPlanSubTitle}>
-                Yangın Emniyeti Sınırı: {MockDataStore.venue.fireCapacity} PAX | Bir masa seçerek detaylarını yönetin.
+                Yangın Emniyeti Sınırı: {MockDataStore.venue.fireCapacity} PAX | Bir masa seçerek operasyonunu yönetin.
               </p>
             </div>
             <div className={floorPlanBadgeGroup}>
@@ -424,14 +420,14 @@ export default function OperationalWorkspaceDesk() {
                         Opsiyonla & Rezerve Et
                       </Button>
                       <Button variant="primary" onClick={() => setIsSaleModalOpen(true)}>
-                        Dış Sistem Satışını İşle (Biletix / Passo)
+                        Dış Satış Bildirimini Kaydet
                       </Button>
                     </>
                   )}
                   {selectedAsset.status === 'Reserved' && (
                     <>
                       <Button variant="primary" onClick={() => setIsSaleModalOpen(true)}>
-                        Satışı Kaydet & Bilet Düzenle
+                        Satışı Sisteme İşle
                       </Button>
                       <Button variant="danger" onClick={handleCancelReservation}>
                         Opsiyonu İptal Et
@@ -439,8 +435,8 @@ export default function OperationalWorkspaceDesk() {
                     </>
                   )}
                   {selectedAsset.status === 'Sold' && (
-                    <Button variant="secondary" icon={<QrCode size={14} />} onClick={() => setIsCheckInModalOpen(true)}>
-                      Kapı Check-In Taraması Yap
+                    <Button variant="secondary" icon={<ShieldCheck size={14} />} onClick={() => setIsCheckInModalOpen(true)}>
+                      Kapı Giriş Doğrulaması Yap
                     </Button>
                   )}
                 </div>
@@ -530,7 +526,7 @@ export default function OperationalWorkspaceDesk() {
       <Modal
         isOpen={isSaleModalOpen}
         onClose={() => setIsSaleModalOpen(false)}
-        title={`${selectedAsset?.name} - Dış Sistem Satış Bildirimi (Biletix / Passo)`}
+        title={`${selectedAsset?.name} - Dış Sistem Satış Bildirimi`}
       >
         <div className={modalStack}>
           <div className={modalPriceSummaryBox}>
@@ -541,44 +537,39 @@ export default function OperationalWorkspaceDesk() {
           </div>
 
           <p className={textSubtleSm}>
-            Biletix / Passo kanalından gelen satış bildirimini StageOps operasyon defterine işler. Sırasıyla: Satış Kaydı ➔ Çift Taraflı Muhasebe Defteri ➔ Bilet Üretimi gerçekleşir.
+            Dış kanaldan kesinleşen satışı StageOps operasyon defterine işler. Sırasıyla: Satış Kaydı ➔ Çift Taraflı Muhasebe Defteri ➔ Varlık Statüsü (Satıldı) ➔ SaleRegistered Event Yayınlanması gerçekleşir.
           </p>
 
           <Button variant="primary" onClick={handleProcessExternalSaleConfirmation}>
-            Satışı Sisteme İşle & Bileti Düzenle
+            Satış Kaydını Oluştur & Sisteme İşle
           </Button>
         </div>
       </Modal>
 
-      {/* Kapı Check-In Modalı */}
+      {/* VIP Kapı Giriş Doğrulama Modalı */}
       <Modal
         isOpen={isCheckInModalOpen}
         onClose={() => setIsCheckInModalOpen(false)}
-        title="VIP Kapı Check-In Masası"
+        title={`${selectedAsset?.name} VIP Kapı Giriş Doğrulaması`}
       >
         <div className={modalStack}>
           <p className={modalTextMuted}>
-            VIP Kuzey Kapısında QR Kod Taraması Yapılır. Bilet durumu doğrulanır.
+            VIP Kuzey Kapısında misafir giriş yetkisi doğrulanır. Seçilen varlık için satış ve opsiyon kaydı kontrol edilir.
           </p>
 
-          {MockDataStore.tickets.find((t) => t.status === 'Active') ? (
-            <div className={modalTicketTokenBox}>
-              <p className={textBold}>Aktif Bilet Kodu Taranmaya Hazır</p>
-              <p className={modalTokenCode}>
-                {MockDataStore.tickets.find((t) => t.status === 'Active')?.token}
-              </p>
-            </div>
-          ) : (
-            <p className={modalTextError}>Aktif bilet bulunamadı! Lütfen önce dış sistem satışını işleyin.</p>
-          )}
+          <div className={modalTicketTokenBox}>
+            <p className={textBold}>Saha Varlığı: {selectedAsset?.name}</p>
+            <p className={modalTokenCode}>
+              Giriş Yetkisi: Tarık Özbalkan (Satış Ref: BTX-20260807-18291)
+            </p>
+          </div>
 
           <Button
             variant="primary"
             icon={<UserCheck size={16} />}
             onClick={handleCheckIn}
-            disabled={!MockDataStore.tickets.find((t) => t.status === 'Active')}
           >
-            Müşteri Kapı Girişini Tamamla
+            Kapı Giriş Onayını Tamamla
           </Button>
         </div>
       </Modal>

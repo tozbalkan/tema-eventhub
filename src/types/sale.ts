@@ -21,8 +21,7 @@ export interface AppliedPromotionVO {
 export interface SaleLine {
   id: string;
   saleId: string;
-  itemType: 'Ticket' | 'Package' | 'Parking' | 'Merchandise' | 'FoodBeverage' | 'LoungePass';
-  reservationTicketId?: string;
+  itemType: 'VenueAsset' | 'Package' | 'Parking' | 'Merchandise' | 'FoodBeverage' | 'LoungePass';
   venueAssetId?: string;
   quantity: number;
   unitPrice: number;
@@ -50,7 +49,6 @@ export interface ExternalConfirmationVO {
 export interface RefundItem {
   id: string;
   refundId: string;
-  reservationTicketId: string;
   venueAssetId?: string;
   amount: number;
   status: 'Revoked' | 'Pending';
