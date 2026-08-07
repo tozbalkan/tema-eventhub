@@ -12,7 +12,7 @@ import { IdGenerator } from '@/platform/IdGenerator';
 import fs from 'fs';
 import path from 'path';
 
-describe('PostgreSQL Correctness Baseline (T1 - T17 Integration Tests)', () => {
+describe('PostgreSQL Correctness Baseline (T1 - T21 Integration Tests)', () => {
   let pool: Pool;
 
   beforeAll(async () => {
@@ -233,6 +233,11 @@ describe('PostgreSQL Correctness Baseline (T1 - T17 Integration Tests)', () => {
     const accEntries = await pool.query('SELECT * FROM accounting_entries WHERE source_id = $1', [saleId]);
     const opsProjections = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', ['asset_vip_a1']);
 
+    const revenueEntries = accEntries.rows.filter((x) => x.entry_type === 'SaleRevenue');
+    const commissionEntries = accEntries.rows.filter((x) => x.entry_type === 'PlatformCommission');
+
+    expect(revenueEntries).toHaveLength(1);
+    expect(commissionEntries).toHaveLength(1);
     expect(accEntries.rows.length).toBe(2);
     expect(opsProjections.rows.length).toBe(1);
     expect(opsProjections.rows[0].status).toBe('Sold');
@@ -287,6 +292,11 @@ describe('PostgreSQL Correctness Baseline (T1 - T17 Integration Tests)', () => {
     await UnitOfWork.execute((tx) => AccountingSaleRecordedHandler.handle(event, tx));
 
     const accEntries = await pool.query('SELECT * FROM accounting_entries WHERE source_id = $1', [saleId]);
+    const revenueEntries = accEntries.rows.filter((x) => x.entry_type === 'SaleRevenue');
+    const commissionEntries = accEntries.rows.filter((x) => x.entry_type === 'PlatformCommission');
+
+    expect(revenueEntries).toHaveLength(1);
+    expect(commissionEntries).toHaveLength(1);
     expect(accEntries.rows.length).toBe(2);
   });
 
@@ -333,6 +343,11 @@ describe('PostgreSQL Correctness Baseline (T1 - T17 Integration Tests)', () => {
     expect(publishedResult).toBe(true);
 
     const accEntries = await pool.query('SELECT * FROM accounting_entries WHERE source_id = $1', [saleId]);
+    const revenueEntries = accEntries.rows.filter((x) => x.entry_type === 'SaleRevenue');
+    const commissionEntries = accEntries.rows.filter((x) => x.entry_type === 'PlatformCommission');
+
+    expect(revenueEntries).toHaveLength(1);
+    expect(commissionEntries).toHaveLength(1);
     expect(accEntries.rows.length).toBe(2);
 
     const finalOutbox = await PgOutboxStore.getMessageById(eventId);
@@ -467,23 +482,19 @@ describe('PostgreSQL Correctness Baseline (T1 - T17 Integration Tests)', () => {
 
     await UnitOfWork.execute((tx) => PgOutboxStore.addMessage(tx, 'Sale', saleId, event));
 
-    // Worker A claims with 0-sec lease -> leaseVersion 1
     const claimedA = await PgOutboxStore.claimPendingMessages('worker_A', 1, 0);
     const msgA = claimedA[0]!;
     expect(msgA.leaseVersion).toBe(1);
 
     await new Promise((r) => setTimeout(r, 20));
 
-    // Worker B claims expired message -> leaseVersion 2
     const claimedB = await PgOutboxStore.claimPendingMessages('worker_B', 1, 30);
     const msgB = claimedB[0]!;
     expect(msgB.leaseVersion).toBe(2);
 
-    // Worker A attempts markFailed with stale leaseVersion 1
     const staleFailedResult = await PgOutboxStore.markFailed(msgA.id, msgA.lockedBy!, msgA.leaseVersion, 'Stale error');
-    expect(staleFailedResult).toBe(false); // Fenced out!
+    expect(staleFailedResult).toBe(false);
 
-    // Verify message remains claimed by Worker B with leaseVersion 2
     const msgState = await PgOutboxStore.getMessageById(eventId);
     expect(msgState?.lockedBy).toBe('worker_B');
     expect(msgState?.leaseVersion).toBe(2);
@@ -524,7 +535,6 @@ describe('PostgreSQL Correctness Baseline (T1 - T17 Integration Tests)', () => {
       eventId: eventDbId,
     };
 
-    // Transactional write
     await UnitOfWork.execute(async (tx) => {
       await tx.query(
         `INSERT INTO sales (id, organization_id, event_id, sales_channel_id, external_reference, gross_price, commission_paid, net_revenue, currency, status, created_at)
@@ -539,7 +549,6 @@ describe('PostgreSQL Correctness Baseline (T1 - T17 Integration Tests)', () => {
       await PgOutboxStore.addMessage(tx, 'Sale', saleId, event);
     });
 
-    // 3 duplicate deliveries simulating worker crashes / broker redeliveries
     for (let attempt = 1; attempt <= 3; attempt++) {
       await UnitOfWork.execute((tx) => AccountingSaleRecordedHandler.handle(event, tx));
       await UnitOfWork.execute((tx) => OperationsSaleRecordedHandler.handle(event, tx));
@@ -548,8 +557,97 @@ describe('PostgreSQL Correctness Baseline (T1 - T17 Integration Tests)', () => {
     const accEntries = await pool.query('SELECT * FROM accounting_entries WHERE source_id = $1', [saleId]);
     const opsProjections = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', ['asset_bistro_b2']);
 
-    expect(accEntries.rows.length).toBe(2); // exactly 1 revenue + 1 commission
+    const revenueEntries = accEntries.rows.filter((x) => x.entry_type === 'SaleRevenue');
+    const commissionEntries = accEntries.rows.filter((x) => x.entry_type === 'PlatformCommission');
+
+    expect(revenueEntries).toHaveLength(1);
+    expect(commissionEntries).toHaveLength(1);
+    expect(accEntries.rows.length).toBe(2);
     expect(opsProjections.rows.length).toBe(1);
     expect(opsProjections.rows[0].status).toBe('Sold');
+  });
+
+  it('T18: Invalid Asset Validation — Throws error when asset does not exist', async () => {
+    const command = {
+      eventId: 'event_gala_2026',
+      assetId: 'non_existent_asset_id',
+      salesChannelId: 'biletix',
+      externalSaleReference: 'BTX-INVALID-ASSET-001',
+    };
+
+    await expect(
+      UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+      )
+    ).rejects.toThrow('Asset not found');
+
+    const dbSales = await pool.query('SELECT * FROM sales WHERE external_reference = $1', [command.externalSaleReference]);
+    expect(dbSales.rows.length).toBe(0);
+  });
+
+  it('T19: Sold Asset Validation — Throws SEAT_ALREADY_RESERVED when asset status is Sold', async () => {
+    const command = {
+      eventId: 'event_gala_2026',
+      assetId: 'asset_vip_a1', // asset_vip_a1 has status 'Sold' in MockRepositories
+      salesChannelId: 'biletix',
+      externalSaleReference: 'BTX-SOLD-ASSET-001',
+    };
+
+    await expect(
+      UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+      )
+    ).rejects.toThrow('SEAT_ALREADY_RESERVED');
+
+    const dbSales = await pool.query('SELECT * FROM sales WHERE external_reference = $1', [command.externalSaleReference]);
+    expect(dbSales.rows.length).toBe(0);
+  });
+
+  it('T20: Business Uniqueness Constraint — Same Sale with different Event ID is blocked by ux_accounting_source_entry', async () => {
+    const saleId = IdGenerator.generateUUIDv7();
+    const eventA = IdGenerator.generateUUIDv7();
+    const eventB = IdGenerator.generateUUIDv7();
+
+    await UnitOfWork.execute((tx) =>
+      tx.query(
+        `INSERT INTO accounting_entries (id, organization_id, event_id, source_type, source_id, entry_type, amount, currency, accounting_amount, occurred_at)
+         VALUES ($1, 'org_01', $2, 'Sale', $3, 'SaleRevenue', 25000.0, 'TRY', 25000.0, NOW());`,
+        [IdGenerator.generateUUIDv7(), eventA, saleId]
+      )
+    );
+
+    // Attempting to insert same (organization_id, source_type, source_id, entry_type) with eventB throws unique constraint error
+    await expect(
+      UnitOfWork.execute((tx) =>
+        tx.query(
+          `INSERT INTO accounting_entries (id, organization_id, event_id, source_type, source_id, entry_type, amount, currency, accounting_amount, occurred_at)
+           VALUES ($1, 'org_01', $2, 'Sale', $3, 'SaleRevenue', 25000.0, 'TRY', 25000.0, NOW());`,
+          [IdGenerator.generateUUIDv7(), eventB, saleId]
+        )
+      )
+    ).rejects.toThrow();
+  });
+
+  it('T21: Faithful Duplicate Aggregate Representation — Duplicate command returns complete lines & pricing', async () => {
+    const command = {
+      eventId: 'event_gala_2026',
+      assetId: 'asset_bistro_b3',
+      salesChannelId: 'biletix',
+      externalSaleReference: 'BTX-FAITHFUL-DUP-001',
+    };
+
+    const res1 = await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+    );
+
+    const res2 = await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+    );
+
+    expect(res2.isDuplicateRecord).toBe(true);
+    expect(res2.sale.id).toBe(res1.sale.id);
+    expect(res2.sale.lines).toHaveLength(1);
+    expect(res2.sale.lines[0]?.venueAssetId).toBe('asset_bistro_b3');
+    expect(res2.sale.grossPrice).toBe(res1.sale.grossPrice);
   });
 });

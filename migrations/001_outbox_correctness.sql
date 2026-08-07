@@ -79,8 +79,9 @@ CREATE TABLE IF NOT EXISTS accounting_entries (
   created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Defense in depth: Unique constraint on accounting entry business keys
-CREATE UNIQUE INDEX IF NOT EXISTS ux_accounting_source_entry ON accounting_entries (organization_id, event_id, source_type, source_id, entry_type);
+-- Defense in depth: Business-level Unique constraint per (organization_id, source_type, source_id, entry_type)
+DROP INDEX IF EXISTS ux_accounting_source_entry;
+CREATE UNIQUE INDEX ux_accounting_source_entry ON accounting_entries (organization_id, source_type, source_id, entry_type);
 
 -- Operations Projections (Business Mutation)
 CREATE TABLE IF NOT EXISTS venue_asset_projections (

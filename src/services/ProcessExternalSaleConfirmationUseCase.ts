@@ -63,6 +63,22 @@ export class ProcessExternalSaleConfirmationUseCase {
 
       if (existingSaleRes.rows.length > 0) {
         const row = existingSaleRes.rows[0];
+        const linesRes = await client.query('SELECT * FROM sale_lines WHERE sale_id = $1', [row.id]);
+        
+        const lines = linesRes.rows.map((l) => ({
+          id: l.id,
+          saleId: row.id,
+          itemType: 'VenueAsset' as const,
+          venueAssetId: l.venue_asset_id,
+          quantity: l.quantity,
+          unitPrice: parseFloat(l.unit_price),
+          discountAmount: 0,
+          taxAmount: parseFloat(l.unit_price) * 0.2,
+          totalPrice: parseFloat(l.total_price),
+          currency: row.currency,
+          exchangeRate: 1.0,
+        }));
+
         const existingSale: Sale = {
           id: row.id,
           organizationId: row.organization_id,
@@ -71,17 +87,17 @@ export class ProcessExternalSaleConfirmationUseCase {
           salesChannelId: row.sales_channel_id,
           externalReference: row.external_reference,
           channel: { type: 'ExternalChannel', name: row.sales_channel_id, reference: row.external_reference },
-          purchaserSnapshot: { fullName: row.purchaser_name || 'VIP Guest', phone: '', email: '' },
+          purchaserSnapshot: { fullName: row.purchaser_name || 'VIP Guest', phone: cmd.purchaserPhone || '', email: cmd.purchaserEmail || '' },
           saleDate: row.created_at,
           grossPrice: parseFloat(row.gross_price),
-          commissionRate: 0.06,
+          commissionRate: parseFloat(row.gross_price) > 0 ? parseFloat(row.commission_paid) / parseFloat(row.gross_price) : 0,
           commissionPaid: parseFloat(row.commission_paid),
           netRevenue: parseFloat(row.net_revenue),
           currency: row.currency,
           exchangeRate: 1.0,
           exchangeRateSource: 'TCMB',
           accountingAmount: parseFloat(row.gross_price),
-          lines: [],
+          lines,
           revenueSplit: {
             organizerAmount: { minorUnits: BigInt(Math.round(parseFloat(row.net_revenue) * 100)), currency: row.currency, scale: 100 },
             platformCommission: { minorUnits: BigInt(Math.round(parseFloat(row.commission_paid) * 100)), currency: row.currency, scale: 100 },
@@ -101,9 +117,16 @@ export class ProcessExternalSaleConfirmationUseCase {
         };
       }
 
-      // Dynamic pricing & domain lookup
+      // 2. Asset existence and status validation (parity with in-memory path)
       const asset = VenueService.getAssetById(cmd.assetId);
-      const grossPrice = asset ? asset.pricing.basePrice : 25000.0;
+      if (!asset) {
+        throw new Error('Asset not found');
+      }
+      if (asset.status === 'Sold') {
+        throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
+      }
+
+      const grossPrice = asset.pricing.basePrice;
       const defaultChannel: SalesChannel = { id: 'desk', name: 'Organizasyon Masası', commissionPercentage: 0.0, isArchived: false };
       const channel = MockDataStore.salesChannels.find((c) => c.id === cmd.salesChannelId) ?? defaultChannel;
       const commissionRate = channel.commissionPercentage / 100;
@@ -118,7 +141,7 @@ export class ProcessExternalSaleConfirmationUseCase {
 
       const sale: Sale = {
         id: saleId,
-        organizationId: 'org_indigo_01',
+        organizationId: MockDataStore.organizationId,
         eventId: cmd.eventId,
         reservationId: cmd.reservationId,
         salesChannelId: cmd.salesChannelId,
@@ -130,7 +153,7 @@ export class ProcessExternalSaleConfirmationUseCase {
         commissionRate,
         commissionPaid,
         netRevenue,
-        currency: asset ? asset.pricing.currency : 'TRY',
+        currency: asset.pricing.currency,
         exchangeRate: 1.0,
         exchangeRateSource: 'TCMB',
         accountingAmount: grossPrice,
@@ -145,15 +168,15 @@ export class ProcessExternalSaleConfirmationUseCase {
             discountAmount: 0,
             taxAmount: grossPrice * 0.2,
             totalPrice: grossPrice,
-            currency: asset ? asset.pricing.currency : 'TRY',
+            currency: asset.pricing.currency,
             exchangeRate: 1.0,
           },
         ],
         revenueSplit: {
-          organizerAmount: { minorUnits: BigInt(Math.round(netRevenue * 100)), currency: asset ? asset.pricing.currency : 'TRY', scale: 100 },
-          platformCommission: { minorUnits: BigInt(Math.round(commissionPaid * 100)), currency: asset ? asset.pricing.currency : 'TRY', scale: 100 },
-          gatewayFee: { minorUnits: BigInt(0), currency: asset ? asset.pricing.currency : 'TRY', scale: 100 },
-          taxAmount: { minorUnits: BigInt(Math.round(grossPrice * 0.2 * 100)), currency: asset ? asset.pricing.currency : 'TRY', scale: 100 },
+          organizerAmount: { minorUnits: BigInt(Math.round(netRevenue * 100)), currency: asset.pricing.currency, scale: 100 },
+          platformCommission: { minorUnits: BigInt(Math.round(commissionPaid * 100)), currency: asset.pricing.currency, scale: 100 },
+          gatewayFee: { minorUnits: BigInt(0), currency: asset.pricing.currency, scale: 100 },
+          taxAmount: { minorUnits: BigInt(Math.round(grossPrice * 0.2 * 100)), currency: asset.pricing.currency, scale: 100 },
         },
         status: 'Completed',
         notes: 'PostgreSQL sale record',
@@ -164,7 +187,7 @@ export class ProcessExternalSaleConfirmationUseCase {
       };
 
       try {
-        // 2. INSERT Sale aggregate into PostgreSQL
+        // 3. INSERT Sale aggregate into PostgreSQL
         const saleQuery = `
           INSERT INTO sales (
             id, organization_id, event_id, reservation_id, sales_channel_id,
@@ -188,14 +211,14 @@ export class ProcessExternalSaleConfirmationUseCase {
           nowISO,
         ]);
 
-        // 3. INSERT Sale lines into PostgreSQL in SAME transaction!
+        // 4. INSERT Sale lines into PostgreSQL in SAME transaction!
         const lineQuery = `
           INSERT INTO sale_lines (id, sale_id, venue_asset_id, quantity, unit_price, total_price)
           VALUES ($1, $2, $3, 1, $4, $4);
         `;
         await client.query(lineQuery, [lineId, sale.id, cmd.assetId, grossPrice]);
 
-        // 4. INSERT OutboxMessage into PostgreSQL in SAME transaction!
+        // 5. INSERT OutboxMessage into PostgreSQL in SAME transaction!
         const event: SaleRecordedDomainEvent = {
           eventName: DomainEventNames.SaleRecorded,
           header: {
@@ -229,6 +252,21 @@ export class ProcessExternalSaleConfirmationUseCase {
           );
           if (fetchExisting.rows.length > 0) {
             const row = fetchExisting.rows[0];
+            const linesRes = await pool.query('SELECT * FROM sale_lines WHERE sale_id = $1', [row.id]);
+            const lines = linesRes.rows.map((l) => ({
+              id: l.id,
+              saleId: row.id,
+              itemType: 'VenueAsset' as const,
+              venueAssetId: l.venue_asset_id,
+              quantity: l.quantity,
+              unitPrice: parseFloat(l.unit_price),
+              discountAmount: 0,
+              taxAmount: parseFloat(l.unit_price) * 0.2,
+              totalPrice: parseFloat(l.total_price),
+              currency: row.currency,
+              exchangeRate: 1.0,
+            }));
+
             return {
               sale: {
                 ...sale,
@@ -236,6 +274,7 @@ export class ProcessExternalSaleConfirmationUseCase {
                 grossPrice: parseFloat(row.gross_price),
                 commissionPaid: parseFloat(row.commission_paid),
                 netRevenue: parseFloat(row.net_revenue),
+                lines,
               },
               isDuplicateRecord: true,
             };
