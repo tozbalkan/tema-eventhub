@@ -37,11 +37,13 @@ export interface ProcessExternalSaleConfirmationResult {
 /**
  * StageOps Application Use Case: Process External Sale Confirmation.
  * 
- * Production Transaction Flow (Non-Aborting SQL Pattern):
+ * Production Transaction Flow (Phantom-Free Non-Aborting SQL Pattern):
  * 1. Command Idempotency Check (SELECT existing sale for channel + reference)
- * 2. Atomic Asset Acquisition & Locking (INSERT/UPDATE venue_asset_projections WHERE status <> 'Sold')
- * 3. Command Idempotency Fallback Check (If asset is already sold, check if it belongs to same external reference)
- * 4. Atomic Sale Aggregate Persistence (INSERT INTO sales ON CONFLICT DO NOTHING RETURNING id)
+ * 2. Asset existence & status pre-validation
+ * 3. Reserve Sale Ownership FIRST (INSERT INTO sales ON CONFLICT DO NOTHING RETURNING id)
+ *    - If duplicate detected: Return existing sale payload WITHOUT mutating asset projections (Zero Phantom Side-Effects!)
+ * 4. Lock & Mutate Asset Projection ONLY IF sale ownership was won!
+ *    - If asset is already sold: Throw SEAT_ALREADY_RESERVED (triggers UnitOfWork ROLLBACK of step 3 sale insert)
  * 5. Persist Sale Lines & OutboxMessage in SAME PostgreSQL Transaction
  * 6. UnitOfWork commits cleanly without 23505 transaction abortion
  */
@@ -55,7 +57,7 @@ export class ProcessExternalSaleConfirmationUseCase {
     if (cmd.pgClient) {
       const client = cmd.pgClient;
 
-      // 1. PostgreSQL Command Idempotency Check (Check if sale already exists for channel + external reference)
+      // 1. Command Idempotency Check (Check if sale already exists for channel + external reference)
       const existingSaleRes = await client.query(
         'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
         [cmd.salesChannelId, cmd.externalSaleReference]
@@ -82,47 +84,6 @@ export class ProcessExternalSaleConfirmationUseCase {
         throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
       }
 
-      // 3. PostgreSQL Database Transaction Lock FOR UPDATE on venue_asset_projections
-      const projLockRes = await client.query(
-        'SELECT status FROM venue_asset_projections WHERE asset_id = $1 FOR UPDATE',
-        [cmd.assetId]
-      );
-      if (projLockRes.rows.length > 0 && projLockRes.rows[0].status === 'Sold') {
-        const checkExistingInTx = await client.query(
-          'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
-          [cmd.salesChannelId, cmd.externalSaleReference]
-        );
-        if (checkExistingInTx.rows.length > 0) {
-          return this.reconstructDuplicateSaleResponse(client, checkExistingInTx.rows[0], cmd);
-        }
-        throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
-      }
-
-      // 4. Atomic Asset Acquisition & Locking in SAME transaction
-      const lockAssetQuery = `
-        INSERT INTO venue_asset_projections (
-          asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated
-        ) VALUES ($1, $2, 'VIP', 'Sold', 'Occupied', 6, $3, 1, NOW())
-        ON CONFLICT (asset_id) DO UPDATE SET
-          status = 'Sold',
-          occupancy_state = 'Occupied',
-          version = venue_asset_projections.version + 1,
-          last_updated = NOW()
-        WHERE venue_asset_projections.status <> 'Sold';
-      `;
-      const lockRes = await client.query(lockAssetQuery, [cmd.assetId, asset.name, asset.pricing.basePrice]);
-      if (lockRes.rowCount === 0) {
-        // If asset locking failed, check if same external reference succeeded in concurrent transaction
-        const checkExistingPostLock = await client.query(
-          'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
-          [cmd.salesChannelId, cmd.externalSaleReference]
-        );
-        if (checkExistingPostLock.rows.length > 0) {
-          return this.reconstructDuplicateSaleResponse(client, checkExistingPostLock.rows[0], cmd);
-        }
-        throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
-      }
-
       const grossPrice = asset.pricing.basePrice;
       const defaultChannel: SalesChannel = { id: 'desk', name: 'Organizasyon Masası', commissionPercentage: 0.0, isArchived: false };
       const channel = MockDataStore.salesChannels.find((c) => c.id === cmd.salesChannelId) ?? defaultChannel;
@@ -145,9 +106,9 @@ export class ProcessExternalSaleConfirmationUseCase {
         externalReference: cmd.externalSaleReference,
         channel: { type: 'ExternalChannel', name: channel.name, reference: cmd.externalSaleReference },
         purchaserSnapshot: {
-          fullName: cmd.purchaserName || 'Emre Kaya',
-          phone: cmd.purchaserPhone || '+905351234567',
-          email: cmd.purchaserEmail || 'emre@vip.com',
+          fullName: cmd.purchaserName || 'Unspecified Purchaser',
+          phone: cmd.purchaserPhone || '',
+          email: cmd.purchaserEmail || '',
         },
         saleDate: nowISO,
         grossPrice,
@@ -187,7 +148,8 @@ export class ProcessExternalSaleConfirmationUseCase {
         updatedAt: nowISO,
       };
 
-      // 5. Non-Aborting SQL Insertion: ON CONFLICT DO NOTHING RETURNING id
+      // 3. Non-Aborting SQL Sale Ownership Reservation: ON CONFLICT DO NOTHING RETURNING id
+      // Prevents PostgreSQL transaction from entering aborted state AND determines sale ownership BEFORE asset mutation!
       const saleQuery = `
         INSERT INTO sales (
           id, organization_id, event_id, reservation_id, sales_channel_id,
@@ -215,6 +177,7 @@ export class ProcessExternalSaleConfirmationUseCase {
         nowISO,
       ]);
 
+      // If another transaction inserted this external reference concurrently, fetch existing sale WITHOUT MUTATING ASSETS!
       if (insertSaleRes.rows.length === 0) {
         const fetchExisting = await client.query(
           'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
@@ -225,20 +188,33 @@ export class ProcessExternalSaleConfirmationUseCase {
         }
       }
 
-      // 6. Update sale_id on venue_asset_projections
-      await client.query(
-        'UPDATE venue_asset_projections SET sale_id = $1, reservation_id = $2 WHERE asset_id = $3',
-        [sale.id, sale.reservationId, cmd.assetId]
-      );
+      // 4. Atomic Asset Acquisition & Locking ONLY AFTER Sale Ownership is Won!
+      const lockAssetQuery = `
+        INSERT INTO venue_asset_projections (
+          asset_id, name, category, status, occupancy_state, sale_id, reservation_id, pax_capacity, base_price, version, last_updated
+        ) VALUES ($1, $2, 'VIP', 'Sold', 'Occupied', $3, $4, 6, $5, 1, NOW())
+        ON CONFLICT (asset_id) DO UPDATE SET
+          status = 'Sold',
+          occupancy_state = 'Occupied',
+          sale_id = EXCLUDED.sale_id,
+          version = venue_asset_projections.version + 1,
+          last_updated = NOW()
+        WHERE venue_asset_projections.status <> 'Sold';
+      `;
+      const lockRes = await client.query(lockAssetQuery, [cmd.assetId, asset.name, sale.id, sale.reservationId, grossPrice]);
+      if (lockRes.rowCount === 0) {
+        // If asset locking failed because asset was already sold to another sale, throw error to trigger ROLLBACK of Step 3 sale insert!
+        throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
+      }
 
-      // 7. INSERT Sale lines into PostgreSQL in SAME transaction
+      // 5. INSERT Sale lines into PostgreSQL in SAME transaction
       const lineQuery = `
         INSERT INTO sale_lines (id, sale_id, venue_asset_id, quantity, unit_price, total_price)
         VALUES ($1, $2, $3, 1, $4, $4);
       `;
       await client.query(lineQuery, [lineId, sale.id, cmd.assetId, grossPrice]);
 
-      // 8. INSERT OutboxMessage into PostgreSQL in SAME transaction
+      // 6. INSERT OutboxMessage into PostgreSQL in SAME transaction
       const event: SaleRecordedDomainEvent = {
         eventName: DomainEventNames.SaleRecorded,
         header: {
@@ -330,9 +306,9 @@ export class ProcessExternalSaleConfirmationUseCase {
           reference: cmd.externalSaleReference,
         },
         purchaserSnapshot: {
-          fullName: cmd.purchaserName || 'Emre Kaya',
-          phone: cmd.purchaserPhone || '+905351234567',
-          email: cmd.purchaserEmail || 'emre@vip.com',
+          fullName: cmd.purchaserName || 'Unspecified Purchaser',
+          phone: cmd.purchaserPhone || '',
+          email: cmd.purchaserEmail || '',
         },
         saleDate: nowISO,
         grossPrice,
@@ -445,7 +421,7 @@ export class ProcessExternalSaleConfirmationUseCase {
       externalReference: row.external_reference,
       channel: { type: 'ExternalChannel', name: row.sales_channel_id, reference: row.external_reference },
       purchaserSnapshot: {
-        fullName: row.purchaser_name || 'VIP Guest',
+        fullName: row.purchaser_name || 'Unspecified Purchaser',
         phone: row.purchaser_phone || cmd.purchaserPhone || '',
         email: row.purchaser_email || cmd.purchaserEmail || '',
       },

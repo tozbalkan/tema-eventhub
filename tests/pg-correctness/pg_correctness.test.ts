@@ -12,7 +12,7 @@ import { IdGenerator } from '@/platform/IdGenerator';
 import fs from 'fs';
 import path from 'path';
 
-describe('PostgreSQL Correctness Baseline (T1 - T32 Integration Tests)', () => {
+describe('PostgreSQL Correctness Baseline (T1 - T33 Integration Tests)', () => {
   let pool: Pool;
 
   beforeAll(async () => {
@@ -781,7 +781,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T32 Integration Tests)', () => {
     expect(claimedAfterCommit.length).toBe(1);
   });
 
-  it('T27: Pre-populated Available Asset Race (T28)', async () => {
+  it('T27: Pre-populated Available Asset Race', async () => {
     const targetAssetId = 'asset_vip_a4';
 
     await pool.query(
@@ -810,7 +810,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T32 Integration Tests)', () => {
     expect(rejectedSales.length).toBe(9);
   });
 
-  it('T28: Same External Reference Race with Pre-populated Asset (T29)', async () => {
+  it('T28: Same External Reference Race with Pre-populated Asset', async () => {
     const targetAssetId = 'asset_bistro_b1';
 
     await pool.query(
@@ -840,7 +840,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T32 Integration Tests)', () => {
     expect(duplicates.length).toBe(9);
   });
 
-  it('T29: Duplicate Response Transaction Health (T31) — UnitOfWork COMMIT succeeds on same transaction client', async () => {
+  it('T29: Duplicate Response Transaction Health — UnitOfWork COMMIT succeeds on same transaction client', async () => {
     const command = {
       eventId: 'event_gala_2026',
       assetId: 'asset_bistro_b2',
@@ -865,7 +865,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T32 Integration Tests)', () => {
     expect(duplicateResult.isDuplicateRecord).toBe(true);
   });
 
-  it('T30: Same External Reference Uncommitted Overlap (T30)', async () => {
+  it('T30: Same External Reference Uncommitted Overlap', async () => {
     const targetAssetId = 'asset_bistro_b3';
     const command = {
       eventId: 'event_gala_2026',
@@ -916,8 +916,61 @@ describe('PostgreSQL Correctness Baseline (T1 - T32 Integration Tests)', () => {
     expect(duplicateCount).toBe(14);
   });
 
-  it('T32: Complete Invariant Matrix Baseline Validation — 32 Invariants Verified', async () => {
-    const salesCount = await pool.query('SELECT COUNT(*) FROM sales');
-    expect(parseInt(salesCount.rows[0].count)).toBeGreaterThanOrEqual(0);
+  it('T32: Database Consistent Schema Sanity Verification', async () => {
+    const salesRes = await pool.query('SELECT COUNT(*) FROM sales');
+    const outboxRes = await pool.query('SELECT COUNT(*) FROM outbox_messages');
+    expect(parseInt(salesRes.rows[0].count)).toBeGreaterThanOrEqual(0);
+    expect(parseInt(outboxRes.rows[0].count)).toBeGreaterThanOrEqual(0);
+  });
+
+  it('T33: Same External Reference + Different Assets Phantom Side-Effect Protection', async () => {
+    const ref = 'BTX-PHANTOM-REF-001';
+    const winningAssetId = 'asset_vip_a4';
+    const losingAssetId = 'asset_bistro_b1';
+
+    // Pre-populate both assets as Available
+    await pool.query(
+      `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
+       VALUES 
+        ($1, 'VIP Asset A4', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW()),
+        ($2, 'Bistro B1', 'Bistro', 'Available', 'Vacant', 4, 12000, 1, NOW());`,
+      [winningAssetId, losingAssetId]
+    );
+
+    // Launch two parallel requests with SAME external reference but DIFFERENT asset IDs!
+    const taskA = UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({
+        eventId: 'event_gala_2026',
+        assetId: winningAssetId,
+        salesChannelId: 'biletix',
+        externalSaleReference: ref,
+        pgClient: tx,
+      })
+    );
+
+    const taskB = UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({
+        eventId: 'event_gala_2026',
+        assetId: losingAssetId,
+        salesChannelId: 'biletix',
+        externalSaleReference: ref,
+        pgClient: tx,
+      })
+    );
+
+    const results = await Promise.all([taskA, taskB]);
+    const originalCount = results.filter((r) => !r.isDuplicateRecord).length;
+    const duplicateCount = results.filter((r) => r.isDuplicateRecord).length;
+
+    expect(originalCount).toBe(1);
+    expect(duplicateCount).toBe(1);
+
+    // 1. Verify exactly ONE sale exists in sales table for this reference
+    const dbSales = await pool.query('SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2', ['biletix', ref]);
+    expect(dbSales.rows.length).toBe(1);
+
+    // 2. CRITICAL ASSERTION: The losing asset (losingAssetId) MUST NOT BE MARKED SOLD! Zero Phantom Side-Effects!
+    const losingProj = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', [losingAssetId]);
+    expect(losingProj.rows[0].status).toBe('Available');
   });
 });
