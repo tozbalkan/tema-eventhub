@@ -8,6 +8,7 @@ import { SaleRecordedDomainEvent, DomainEventNames } from '@/domain/events/Domai
 import { IdempotencyStore } from '@/platform/IdempotencyStore';
 import { OutboxStore } from '@/platform/OutboxStore';
 import { PgOutboxStore } from '@/platform/pg/PgOutboxStore';
+import { PgPool } from '@/platform/pg/PgPool';
 import { OutboxPublisherWorker } from '@/platform/OutboxPublisherWorker';
 import { bootstrapStageOpsApplication } from '@/application/Bootstrap';
 
@@ -162,61 +163,86 @@ export class ProcessExternalSaleConfirmationUseCase {
         updatedAt: nowISO,
       };
 
-      // 2. INSERT Sale aggregate into PostgreSQL
-      const saleQuery = `
-        INSERT INTO sales (
-          id, organization_id, event_id, reservation_id, sales_channel_id,
-          external_reference, purchaser_name, gross_price, commission_paid,
-          net_revenue, currency, status, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13);
-      `;
-      await client.query(saleQuery, [
-        sale.id,
-        sale.organizationId,
-        sale.eventId,
-        sale.reservationId,
-        sale.salesChannelId,
-        sale.externalReference,
-        sale.purchaserSnapshot?.fullName,
-        sale.grossPrice,
-        sale.commissionPaid,
-        sale.netRevenue,
-        sale.currency,
-        sale.status,
-        nowISO,
-      ]);
+      try {
+        // 2. INSERT Sale aggregate into PostgreSQL
+        const saleQuery = `
+          INSERT INTO sales (
+            id, organization_id, event_id, reservation_id, sales_channel_id,
+            external_reference, purchaser_name, gross_price, commission_paid,
+            net_revenue, currency, status, created_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13);
+        `;
+        await client.query(saleQuery, [
+          sale.id,
+          sale.organizationId,
+          sale.eventId,
+          sale.reservationId,
+          sale.salesChannelId,
+          sale.externalReference,
+          sale.purchaserSnapshot?.fullName,
+          sale.grossPrice,
+          sale.commissionPaid,
+          sale.netRevenue,
+          sale.currency,
+          sale.status,
+          nowISO,
+        ]);
 
-      // 3. INSERT Sale lines into PostgreSQL in SAME transaction!
-      const lineQuery = `
-        INSERT INTO sale_lines (id, sale_id, venue_asset_id, quantity, unit_price, total_price)
-        VALUES ($1, $2, $3, 1, $4, $4);
-      `;
-      await client.query(lineQuery, [lineId, sale.id, cmd.assetId, grossPrice]);
+        // 3. INSERT Sale lines into PostgreSQL in SAME transaction!
+        const lineQuery = `
+          INSERT INTO sale_lines (id, sale_id, venue_asset_id, quantity, unit_price, total_price)
+          VALUES ($1, $2, $3, 1, $4, $4);
+        `;
+        await client.query(lineQuery, [lineId, sale.id, cmd.assetId, grossPrice]);
 
-      // 4. INSERT OutboxMessage into PostgreSQL in SAME transaction!
-      const event: SaleRecordedDomainEvent = {
-        eventName: DomainEventNames.SaleRecorded,
-        header: {
-          eventId: IdGenerator.generateUUIDv7(),
-          eventVersion: 1,
-          occurredAt: nowISO,
-          correlationId,
-          causationId: commandId,
-          tenantId: sale.organizationId,
-          traceId: cmd.traceId,
-          spanId: cmd.spanId,
-        },
-        saleId: sale.id,
-        eventId: sale.eventId,
-      };
+        // 4. INSERT OutboxMessage into PostgreSQL in SAME transaction!
+        const event: SaleRecordedDomainEvent = {
+          eventName: DomainEventNames.SaleRecorded,
+          header: {
+            eventId: IdGenerator.generateUUIDv7(),
+            eventVersion: 1,
+            occurredAt: nowISO,
+            correlationId,
+            causationId: commandId,
+            tenantId: sale.organizationId,
+            traceId: cmd.traceId,
+            spanId: cmd.spanId,
+          },
+          saleId: sale.id,
+          eventId: sale.eventId,
+        };
 
-      await PgOutboxStore.addMessage(client, 'Sale', sale.id, event);
+        await PgOutboxStore.addMessage(client, 'Sale', sale.id, event);
 
-      return {
-        sale,
-        event,
-        isDuplicateRecord: false,
-      };
+        return {
+          sale,
+          event,
+          isDuplicateRecord: false,
+        };
+      } catch (err: any) {
+        // Catch PostgreSQL 23505 unique violation on ux_sales_external_reference
+        if (err.code === '23505' || (err.message && err.message.includes('ux_sales_external_reference'))) {
+          const pool = PgPool.getPool();
+          const fetchExisting = await pool.query(
+            'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
+            [cmd.salesChannelId, cmd.externalSaleReference]
+          );
+          if (fetchExisting.rows.length > 0) {
+            const row = fetchExisting.rows[0];
+            return {
+              sale: {
+                ...sale,
+                id: row.id,
+                grossPrice: parseFloat(row.gross_price),
+                commissionPaid: parseFloat(row.commission_paid),
+                netRevenue: parseFloat(row.net_revenue),
+              },
+              isDuplicateRecord: true,
+            };
+          }
+        }
+        throw err;
+      }
     }
 
     // In-Memory Reference Execution Path

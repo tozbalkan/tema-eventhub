@@ -12,7 +12,7 @@ import { IdGenerator } from '@/platform/IdGenerator';
 import fs from 'fs';
 import path from 'path';
 
-describe('PostgreSQL Correctness Baseline (T1 - T14 Integration Tests)', () => {
+describe('PostgreSQL Correctness Baseline (T1 - T17 Integration Tests)', () => {
   let pool: Pool;
 
   beforeAll(async () => {
@@ -386,13 +386,11 @@ describe('PostgreSQL Correctness Baseline (T1 - T14 Integration Tests)', () => {
       externalSaleReference: 'BTX-DUP-TEST-001',
     };
 
-    // First call creates Sale + OutboxMessage
     const res1 = await UnitOfWork.execute((tx) =>
       ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
     );
     expect(res1.isDuplicateRecord).toBe(false);
 
-    // Second call with same salesChannelId + externalSaleReference detects duplicate sale
     const res2 = await UnitOfWork.execute((tx) =>
       ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
     );
@@ -427,5 +425,131 @@ describe('PostgreSQL Correctness Baseline (T1 - T14 Integration Tests)', () => {
         )
       )
     ).rejects.toThrow();
+  });
+
+  it('T14: Concurrent Duplicate Commands — 10 parallel commands produce exactly 1 sale row', async () => {
+    const command = {
+      eventId: 'event_gala_2026',
+      assetId: 'asset_vip_a4',
+      salesChannelId: 'biletix',
+      externalSaleReference: 'BTX-RACE-CONCURRENT-001',
+    };
+
+    const tasks = Array.from({ length: 10 }, () =>
+      UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+      )
+    );
+
+    const results = await Promise.all(tasks);
+    const originalCount = results.filter((r) => !r.isDuplicateRecord).length;
+    const duplicateCount = results.filter((r) => r.isDuplicateRecord).length;
+
+    expect(originalCount).toBe(1);
+    expect(duplicateCount).toBe(9);
+
+    const dbSales = await pool.query(
+      'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
+      [command.salesChannelId, command.externalSaleReference]
+    );
+    expect(dbSales.rows.length).toBe(1);
+  });
+
+  it('T15: Stale Worker markFailed Fencing — Mismatched lease_version fails fencing check', async () => {
+    const eventId = IdGenerator.generateUUIDv7();
+    const saleId = IdGenerator.generateUUIDv7();
+    const event: SaleRecordedDomainEvent = {
+      eventName: DomainEventNames.SaleRecorded,
+      header: { eventId, eventVersion: 1, occurredAt: new Date().toISOString() },
+      saleId,
+      eventId: IdGenerator.generateUUIDv7(),
+    };
+
+    await UnitOfWork.execute((tx) => PgOutboxStore.addMessage(tx, 'Sale', saleId, event));
+
+    // Worker A claims with 0-sec lease -> leaseVersion 1
+    const claimedA = await PgOutboxStore.claimPendingMessages('worker_A', 1, 0);
+    const msgA = claimedA[0]!;
+    expect(msgA.leaseVersion).toBe(1);
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Worker B claims expired message -> leaseVersion 2
+    const claimedB = await PgOutboxStore.claimPendingMessages('worker_B', 1, 30);
+    const msgB = claimedB[0]!;
+    expect(msgB.leaseVersion).toBe(2);
+
+    // Worker A attempts markFailed with stale leaseVersion 1
+    const staleFailedResult = await PgOutboxStore.markFailed(msgA.id, msgA.lockedBy!, msgA.leaseVersion, 'Stale error');
+    expect(staleFailedResult).toBe(false); // Fenced out!
+
+    // Verify message remains claimed by Worker B with leaseVersion 2
+    const msgState = await PgOutboxStore.getMessageById(eventId);
+    expect(msgState?.lockedBy).toBe('worker_B');
+    expect(msgState?.leaseVersion).toBe(2);
+  });
+
+  it('T16: Complete Transaction Rollback — Sale, SaleLines & OutboxMessage undone together on error', async () => {
+    const command = {
+      eventId: 'event_gala_2026',
+      assetId: 'asset_bistro_b1',
+      salesChannelId: 'biletix',
+      externalSaleReference: 'BTX-ROLLBACK-TEST-001',
+    };
+
+    await expect(
+      UnitOfWork.execute(async (tx) => {
+        await ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx });
+        throw new Error('SIMULATED_USECASE_COMMITTED_ERROR');
+      })
+    ).rejects.toThrow('SIMULATED_USECASE_COMMITTED_ERROR');
+
+    const dbSales = await pool.query('SELECT * FROM sales WHERE external_reference = $1', [command.externalSaleReference]);
+    const dbOutbox = await pool.query('SELECT * FROM outbox_messages WHERE aggregate_id IN (SELECT id FROM sales WHERE external_reference = $1)', [command.externalSaleReference]);
+
+    expect(dbSales.rows.length).toBe(0);
+    expect(dbOutbox.rows.length).toBe(0);
+  });
+
+  it('T17: Effectively-Once Business Effect — At-least-once delivery + Idempotent consumers + Fenced outbox', async () => {
+    const eventId = IdGenerator.generateUUIDv7();
+    const saleId = IdGenerator.generateUUIDv7();
+    const eventDbId = IdGenerator.generateUUIDv7();
+    const nowISO = new Date().toISOString();
+
+    const event: SaleRecordedDomainEvent = {
+      eventName: DomainEventNames.SaleRecorded,
+      header: { eventId, eventVersion: 1, occurredAt: nowISO },
+      saleId,
+      eventId: eventDbId,
+    };
+
+    // Transactional write
+    await UnitOfWork.execute(async (tx) => {
+      await tx.query(
+        `INSERT INTO sales (id, organization_id, event_id, sales_channel_id, external_reference, gross_price, commission_paid, net_revenue, currency, status, created_at)
+         VALUES ($1, 'org_01', $2, 'biletix', 'REF-T17', 25000, 1500, 23500, 'TRY', 'Completed', $3);`,
+        [saleId, eventDbId, nowISO]
+      );
+      await tx.query(
+        `INSERT INTO sale_lines (id, sale_id, venue_asset_id, quantity, unit_price, total_price)
+         VALUES ($1, $2, 'asset_bistro_b2', 1, 12000, 12000);`,
+        [IdGenerator.generateUUIDv7(), saleId]
+      );
+      await PgOutboxStore.addMessage(tx, 'Sale', saleId, event);
+    });
+
+    // 3 duplicate deliveries simulating worker crashes / broker redeliveries
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await UnitOfWork.execute((tx) => AccountingSaleRecordedHandler.handle(event, tx));
+      await UnitOfWork.execute((tx) => OperationsSaleRecordedHandler.handle(event, tx));
+    }
+
+    const accEntries = await pool.query('SELECT * FROM accounting_entries WHERE source_id = $1', [saleId]);
+    const opsProjections = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', ['asset_bistro_b2']);
+
+    expect(accEntries.rows.length).toBe(2); // exactly 1 revenue + 1 commission
+    expect(opsProjections.rows.length).toBe(1);
+    expect(opsProjections.rows[0].status).toBe('Sold');
   });
 });
