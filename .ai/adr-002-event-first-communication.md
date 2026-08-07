@@ -14,34 +14,30 @@ This tight coupling leads to fragile code, cascading runtime failures, difficult
 
 ---
 
-## 2. Core Communication Rule (Event-First Mandate)
+## 2. Core Communication Rule (Event-First Mandate) & Official Delivery Model
 
 > **No Bounded Context is permitted to invoke state-mutating Application Services or mutate the Aggregates of another Bounded Context directly.**
 
 Inter-Bounded Context state-mutating communication MUST occur exclusively through **Asynchronous Domain Events over the `EventBus`**.
 
-### Standard Execution Pipeline:
+### Official Distributed Delivery Model:
 ```
-  [Application Use Case]
-            │  (Command with commandId, correlationId)
-            ▼
-     [Aggregate Root]
-            │
-            ▼
-    [Repository.save() + OutboxStore.addMessage()]  (100% Atomic Transaction)
-            │
-            ▼
-     [Domain Event]  (Minimal Past-Tense Fact with causationId = commandId)
-            │
-            ▼
-       [EventBus]    (Logical In-Process Dispatcher)
-            │
-            ▼
- [BC Event Handler]  (Operations, Accounting, Notification)
-            │
-            ▼
-[Read Model / Projection]  (VenueAssetProjection, GeneralLedger)
+              DELIVERY MODEL
+
+        Transactional Outbox
+                │
+                ▼
+         At-Least-Once
+            Delivery
+                │
+                ▼
+       Idempotent Consumers
+                │
+                ▼
+       Eventual Consistency
 ```
+
+*Architectural Principle*: StageOps DOES NOT claim impossible "Exactly-Once Delivery". StageOps guarantees **At-Least-Once Delivery + Idempotent Consumers = Eventual Consistency**.
 
 ---
 
@@ -57,15 +53,17 @@ Every Domain Event carries full distributed tracing metadata in `EventHeader`:
 
 ---
 
-## 4. Transactional Outbox & Eventual Consistency Guarantees
+## 4. Transactional Outbox & Multi-Worker Leasing Rules
 
 1. **Transactional Outbox Atomicity**:
    - `OutboxStore` writes the `OutboxMessage` in the exact same database transaction as the `Sale` aggregate. If process crashes before publishing, background workers retry pending outbox messages without event loss.
-2. **Fire-and-Forget & Eventual Consistency**:
+2. **Multi-Worker Leasing Contract**:
+   - Background outbox workers use atomic lease locking (`OutboxStore.claimPendingMessages`) to prevent duplicate dispatching in multi-container scale-out environments (Kubernetes pods).
+3. **Fire-and-Forget & Eventual Consistency**:
    - `EventBus.publish()` dispatches events in a fire-and-forget manner to keep write use cases fast. Projections are updated via **Eventual Consistency**.
-3. **Stream Ordering Guarantee**:
+4. **Stream Ordering Guarantee**:
    - Event ordering guarantees exist **strictly within the same aggregate stream** (`saleId` or `reservationId`). Cross-aggregate event ordering is non-deterministic by design.
-4. **Idempotency Lock & Response Cache Rules**:
+5. **Idempotency Lock & Response Cache Rules**:
    - Commands support Stripe-style cached responses (`IdempotencyStore`) and atomic lock acquisition to prevent race conditions on duplicate external partner webhooks (Biletix, Passo).
 
 ---

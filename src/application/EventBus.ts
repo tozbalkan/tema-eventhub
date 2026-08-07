@@ -46,18 +46,22 @@ export class InMemoryEventBus implements EventBus {
       if (eventHandlers) {
         // Apply deepFreeze to guarantee 100% deep immutability across all nested event properties
         const immutableEvent = deepFreeze(event);
-        const promises = Array.from(eventHandlers).map((handler) =>
-          Promise.resolve(handler(immutableEvent)).catch((err) => {
-            this.logger.error(`Error executing event handler for ${event.eventName}`, err, {
-              eventId: event.header.eventId,
-              correlationId: event.header.correlationId,
-              causationId: event.header.causationId,
-              tenantId: event.header.tenantId,
-              traceId: event.header.traceId,
-            });
-          })
+        const results = await Promise.allSettled(
+          Array.from(eventHandlers).map((handler) => Promise.resolve(handler(immutableEvent)))
         );
-        await Promise.all(promises);
+
+        const rejected = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+        if (rejected.length > 0) {
+          const firstError = rejected[0]?.reason;
+          this.logger.error(`Failed to publish event ${event.eventName} due to ${rejected.length} handler errors`, firstError, {
+            eventId: event.header.eventId,
+            correlationId: event.header.correlationId,
+            causationId: event.header.causationId,
+            tenantId: event.header.tenantId,
+          });
+          // Re-throw so OutboxPublisherWorker marks message as Failed for exponential backoff
+          throw firstError instanceof Error ? firstError : new Error(String(firstError));
+        }
       }
     }
   }
