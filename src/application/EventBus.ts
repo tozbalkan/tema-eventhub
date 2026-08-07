@@ -1,7 +1,12 @@
+import { ConsoleLogger } from '@/platform/Logger';
+
 export interface EventHeader {
   eventId: string; // UUID v7
   eventVersion: number; // e.g. 1
   occurredAt: string; // ISO string
+  correlationId?: string;
+  causationId?: string;
+  tenantId?: string;
 }
 
 export interface DomainEvent {
@@ -21,6 +26,7 @@ export interface EventBus {
 export class InMemoryEventBus implements EventBus {
   private static instance: InMemoryEventBus;
   private handlers: Map<string, Set<EventHandler<any>>> = new Map();
+  private logger = ConsoleLogger.getInstance();
 
   public static getInstance(): InMemoryEventBus {
     if (!InMemoryEventBus.instance) {
@@ -35,9 +41,12 @@ export class InMemoryEventBus implements EventBus {
       const eventHandlers = this.handlers.get(event.eventName);
       if (eventHandlers) {
         eventHandlers.forEach((handler) => {
-          // Promise.resolve ensures async handlers rejecting promises are caught safely
+          // Promise.resolve ensures async handlers rejecting promises are caught safely via structured logger
           Promise.resolve(handler(event)).catch((err) => {
-            console.error(`Error executing event handler for ${event.eventName}:`, err);
+            this.logger.error(`Error executing event handler for ${event.eventName}`, err, {
+              eventId: event.header.eventId,
+              correlationId: event.header.correlationId,
+            });
           });
         });
       }
