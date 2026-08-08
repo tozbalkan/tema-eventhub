@@ -18,6 +18,12 @@ const nextConfig = {
         dns: false,
         pg: false,
         'pg-native': false,
+        'pg-connection-string': false,
+        util: false,
+        'util/types': false,
+        crypto: false,
+        stream: false,
+        path: false,
       };
     }
     return config;

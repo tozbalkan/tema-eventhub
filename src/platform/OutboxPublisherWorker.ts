@@ -1,5 +1,4 @@
-import { OutboxStore, OutboxMessage } from './OutboxStore';
-import { PgOutboxStore, PgOutboxMessage } from './pg/PgOutboxStore';
+import { OutboxStore } from './OutboxStore';
 import { InMemoryEventBus } from '@/application/EventBus';
 import { StructuredJsonLogger } from './Logger';
 import { IdGenerator } from './IdGenerator';
@@ -34,8 +33,9 @@ export class InMemoryOutboxAdapter implements OutboxStoreAdapter {
 
 export class PgOutboxAdapter implements OutboxStoreAdapter {
   async claimPendingMessages(workerId: string, batchSize = 10): Promise<MinimalOutboxItem[]> {
-    const pgMsgs: PgOutboxMessage[] = await PgOutboxStore.claimPendingMessages(workerId, batchSize);
-    return pgMsgs.map((m) => ({
+    const { PgOutboxStore } = await import('./pg/PgOutboxStore');
+    const pgMsgs = await PgOutboxStore.claimPendingMessages(workerId, batchSize);
+    return pgMsgs.map((m: any) => ({
       id: m.id,
       payload: m.payload,
       eventType: m.eventType,
@@ -46,9 +46,11 @@ export class PgOutboxAdapter implements OutboxStoreAdapter {
     }));
   }
   async markPublished(messageId: string, workerId?: string, leaseVersion?: number): Promise<boolean> {
+    const { PgOutboxStore } = await import('./pg/PgOutboxStore');
     return PgOutboxStore.markPublished(messageId, workerId || '', leaseVersion || 0);
   }
   async markFailed(messageId: string, workerId?: string, leaseVersion?: number, error?: any): Promise<boolean> {
+    const { PgOutboxStore } = await import('./pg/PgOutboxStore');
     return PgOutboxStore.markFailed(messageId, workerId || '', leaseVersion || 0, error);
   }
 }
