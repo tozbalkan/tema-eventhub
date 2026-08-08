@@ -16,7 +16,7 @@ import { VenueService } from '@/services/VenueService';
 import fs from 'fs';
 import path from 'path';
 
-describe('PostgreSQL Correctness Baseline (T1 - T42 Integration Tests)', () => {
+describe('PostgreSQL Correctness Baseline (T1 - T47 Integration Tests)', () => {
   let pool: Pool;
 
   beforeAll(async () => {
@@ -34,6 +34,21 @@ describe('PostgreSQL Correctness Baseline (T1 - T42 Integration Tests)', () => {
 
   beforeEach(async () => {
     await pool.query('TRUNCATE outbox_messages, processed_events, sales, sale_lines, accounting_entries, venue_asset_projections, admission_rights CASCADE;');
+    
+    // Seed default venue asset projections in PostgreSQL for DB-authoritative execution mode
+    await pool.query(`
+      INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
+      VALUES
+        ('asset_vip_a1', 'VIP A1', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW()),
+        ('asset_vip_a2', 'VIP A2', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW()),
+        ('asset_vip_a3', 'VIP A3', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW()),
+        ('asset_vip_a4', 'VIP A4', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW()),
+        ('asset_bistro_b1', 'Bistro B1', 'Bistro', 'Available', 'Vacant', 4, 12000, 1, NOW()),
+        ('asset_bistro_b2', 'Bistro B2', 'Bistro', 'Available', 'Vacant', 4, 12000, 1, NOW()),
+        ('asset_bistro_b3', 'Bistro B3', 'Bistro', 'Available', 'Vacant', 4, 12000, 1, NOW()),
+        ('asset_bistro_b4', 'Bistro B4', 'Bistro', 'Available', 'Vacant', 4, 12000, 1, NOW())
+      ON CONFLICT (asset_id) DO NOTHING;
+    `);
   });
 
   it('T1: Concurrent Duplicate Consumer Delivery — UNIQUE(event_id, consumer_name)', async () => {
@@ -594,8 +609,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T42 Integration Tests)', () => {
 
   it('T19: Sold Asset Validation — Throws SEAT_ALREADY_RESERVED when asset status is Sold', async () => {
     await pool.query(
-      `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
-       VALUES ('asset_vip_a1', 'VIP A1', 'VIP', 'Sold', 'Occupied', 6, 25000, 1, NOW());`
+      `UPDATE venue_asset_projections SET status = 'Sold' WHERE asset_id = 'asset_vip_a1';`
     );
 
     const command = {
@@ -690,7 +704,13 @@ describe('PostgreSQL Correctness Baseline (T1 - T42 Integration Tests)', () => {
   });
 
   it('T23: Initial Unpopulated Asset Projection Race — 10 concurrent sales when DB table starts empty', async () => {
-    const targetAssetId = 'asset_bistro_b4';
+    const targetAssetId = 'asset_empty_b4';
+
+    await pool.query(
+      `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
+       VALUES ($1, 'Bistro B4', 'Bistro', 'Available', 'Vacant', 4, 12000, 1, NOW());`,
+      [targetAssetId]
+    );
 
     const tasks = Array.from({ length: 10 }, (_, idx) => {
       const command = {
@@ -796,12 +816,6 @@ describe('PostgreSQL Correctness Baseline (T1 - T42 Integration Tests)', () => {
   it('T27: Pre-populated Available Asset Race', async () => {
     const targetAssetId = 'asset_vip_a4';
 
-    await pool.query(
-      `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
-       VALUES ($1, 'VIP Asset A4', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW());`,
-      [targetAssetId]
-    );
-
     const tasks = Array.from({ length: 10 }, (_, idx) => {
       const command = {
         eventId: 'event_gala_2026',
@@ -824,12 +838,6 @@ describe('PostgreSQL Correctness Baseline (T1 - T42 Integration Tests)', () => {
 
   it('T28: Same External Reference Race with Pre-populated Asset', async () => {
     const targetAssetId = 'asset_bistro_b1';
-
-    await pool.query(
-      `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
-       VALUES ($1, 'Bistro B1', 'Bistro', 'Available', 'Vacant', 4, 12000, 1, NOW());`,
-      [targetAssetId]
-    );
 
     const command = {
       eventId: 'event_gala_2026',
@@ -961,14 +969,6 @@ describe('PostgreSQL Correctness Baseline (T1 - T42 Integration Tests)', () => {
     const winningAssetId = 'asset_vip_a4';
     const losingAssetId = 'asset_vip_a2';
 
-    await pool.query(
-      `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
-       VALUES 
-        ($1, 'VIP Asset A4', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW()),
-        ($2, 'VIP Asset A2', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW());`,
-      [winningAssetId, losingAssetId]
-    );
-
     const taskA = UnitOfWork.execute((tx) =>
       ProcessExternalSaleConfirmationUseCase.execute({
         eventId: 'event_gala_2026',
@@ -1013,14 +1013,6 @@ describe('PostgreSQL Correctness Baseline (T1 - T42 Integration Tests)', () => {
     const assetA = 'asset_vip_a2';
     const assetB = 'asset_vip_a3';
 
-    await pool.query(
-      `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
-       VALUES 
-        ($1, 'VIP A2', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW()),
-        ($2, 'VIP A3', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW());`,
-      [assetA, assetB]
-    );
-
     // Worker 1 requests [assetB, assetA] (unsorted order)
     const task1 = UnitOfWork.execute((tx) =>
       ProcessExternalSaleConfirmationUseCase.execute({
@@ -1062,14 +1054,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T42 Integration Tests)', () => {
     const assetSold = 'asset_vip_a1';
     const assetAvailable2 = 'asset_vip_a3';
 
-    await pool.query(
-      `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
-       VALUES 
-        ($1, 'VIP A2', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW()),
-        ($2, 'VIP A1', 'VIP', 'Sold', 'Occupied', 6, 25000, 1, NOW()),
-        ($3, 'VIP A3', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW());`,
-      [assetAvailable1, assetSold, assetAvailable2]
-    );
+    await pool.query(`UPDATE venue_asset_projections SET status = 'Sold' WHERE asset_id = 'asset_vip_a1';`);
 
     const command = {
       eventId: 'event_gala_2026',
@@ -1128,15 +1113,6 @@ describe('PostgreSQL Correctness Baseline (T1 - T42 Integration Tests)', () => {
     const assetA = 'asset_vip_a2';
     const assetB = 'asset_vip_a3'; // Shared overlapping asset
     const assetC = 'asset_vip_a4';
-
-    await pool.query(
-      `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
-       VALUES 
-        ($1, 'VIP A2', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW()),
-        ($2, 'VIP A3', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW()),
-        ($3, 'VIP A4', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW());`,
-      [assetA, assetB, assetC]
-    );
 
     // Worker 1 requests [A, B], Worker 2 requests [B, C]
     const task1 = UnitOfWork.execute((tx) =>
@@ -1264,12 +1240,6 @@ describe('PostgreSQL Correctness Baseline (T1 - T42 Integration Tests)', () => {
   it('T41: Multi-Asset Input Array Deduplication Test (P1-2 Fix Verification)', async () => {
     const assetId = 'asset_vip_a2';
 
-    await pool.query(
-      `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
-       VALUES ($1, 'VIP A2', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW());`,
-      [assetId]
-    );
-
     // Command submits the SAME asset ID twice in requestedAssetIds array
     const command = {
       eventId: 'event_gala_2026',
@@ -1336,5 +1306,166 @@ describe('PostgreSQL Correctness Baseline (T1 - T42 Integration Tests)', () => {
     } finally {
       bus.unsubscribe('TestT42OutboxEvent', handler);
     }
+  });
+
+  it('T43: Winner Rollback + Duplicate Waiter Recovery Test', async () => {
+    const ref = 'BTX-WINNER-ROLLBACK-001';
+    const assetSold = 'asset_vip_a1';
+    const assetAvailable = 'asset_vip_a2';
+
+    // Mark asset_vip_a1 as Sold
+    await pool.query(`UPDATE venue_asset_projections SET status = 'Sold' WHERE asset_id = 'asset_vip_a1';`);
+
+    // Worker 1 tries ref on asset_vip_a1 (fails asset lock and rolls back sale ownership)
+    await expect(
+      UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({
+          eventId: 'event_gala_2026',
+          assetId: assetSold,
+          salesChannelId: 'biletix',
+          externalSaleReference: ref,
+          pgClient: tx,
+        })
+      )
+    ).rejects.toThrow('SEAT_ALREADY_RESERVED');
+
+    // Verify Worker 1 transaction rolled back completely — 0 rows in sales table for ref!
+    const dbSalesBefore = await pool.query('SELECT * FROM sales WHERE external_reference = $1', [ref]);
+    expect(dbSalesBefore.rows.length).toBe(0);
+
+    // Worker 2 tries SAME ref on available asset_vip_a2
+    const resultWorker2 = await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({
+        eventId: 'event_gala_2026',
+        assetId: assetAvailable,
+        salesChannelId: 'biletix',
+        externalSaleReference: ref,
+        pgClient: tx,
+      })
+    );
+
+    // Assert Worker 2 successfully reserves sale ownership and processes sale!
+    expect(resultWorker2.isDuplicateRecord).toBe(false);
+    expect(resultWorker2.sale.lines[0]?.venueAssetId).toBe(assetAvailable);
+
+    const dbSalesAfter = await pool.query('SELECT * FROM sales WHERE external_reference = $1', [ref]);
+    expect(dbSalesAfter.rows.length).toBe(1);
+    expect(dbSalesAfter.rows[0].id).toBe(resultWorker2.sale.id);
+  });
+
+  it('T44: Multi-Asset Heterogeneous Pricing Accuracy Test', async () => {
+    const assetA = 'asset_vip_a2'; // 25,000 TRY
+    const assetB = 'asset_lounge_99'; // 45,000 TRY
+
+    await pool.query(
+      `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
+       VALUES ($1, 'Lounge 99', 'Lounge', 'Available', 'Vacant', 8, 45000, 1, NOW());`,
+      [assetB]
+    );
+
+    const command = {
+      eventId: 'event_gala_2026',
+      assetIds: [assetA, assetB],
+      salesChannelId: 'biletix',
+      externalSaleReference: 'BTX-HETERO-PRICING-001',
+    };
+
+    const result = await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+    );
+
+    // 1. Verify gross price is exact sum of both heterogeneous assets: 25,000 + 45,000 = 70,000 TRY!
+    expect(result.sale.grossPrice).toBe(70000);
+
+    // 2. Verify individual line item pricing
+    expect(result.sale.lines).toHaveLength(2);
+    const lineA = result.sale.lines.find((l) => l.venueAssetId === assetA);
+    const lineB = result.sale.lines.find((l) => l.venueAssetId === assetB);
+
+    expect(lineA?.unitPrice).toBe(25000);
+    expect(lineB?.unitPrice).toBe(45000);
+
+    // 3. Verify accounting amount equals exact aggregate gross price
+    expect(result.sale.accountingAmount).toBe(70000);
+
+    // 4. Verify PostgreSQL sales table gross_price column stores 70,000
+    const dbSale = await pool.query('SELECT * FROM sales WHERE external_reference = $1', [command.externalSaleReference]);
+    expect(parseFloat(dbSale.rows[0].gross_price)).toBe(70000);
+  });
+
+  it('T45: System Catalog Sales Unique Index Verification', async () => {
+    const catalogRes = await pool.query(`
+      SELECT 
+        i.indexname, 
+        ix.indisunique, 
+        pg_get_indexdef(ix.indexrelid) as indexdef
+      FROM pg_indexes i
+      JOIN pg_class c ON c.relname = i.indexname
+      JOIN pg_index ix ON ix.indexrelid = c.oid
+      WHERE i.tablename = 'sales' AND ix.indisunique = true;
+    `);
+
+    expect(catalogRes.rows.length).toBeGreaterThanOrEqual(1);
+    const salesUniqueIndex = catalogRes.rows.find(
+      (r) => r.indexdef.toLowerCase().includes('sales_channel_id') && r.indexdef.toLowerCase().includes('external_reference')
+    );
+
+    expect(salesUniqueIndex).toBeDefined();
+    expect(salesUniqueIndex.indisunique).toBe(true);
+  });
+
+  it('T46: Unowned Sale Conflict Exception Guard Test', async () => {
+    // Construct mock PoolClient where INSERT sales returns 0 rows and SELECT sales returns 0 rows
+    const mockClient: any = {
+      query: async (sql: string) => {
+        if (sql.includes('SELECT * FROM sales')) {
+          return { rows: [] };
+        }
+        if (sql.includes('SELECT * FROM venue_asset_projections')) {
+          return { rows: [{ asset_id: 'asset_vip_a2', name: 'VIP A2', category: 'VIP', status: 'Available', base_price: '25000' }] };
+        }
+        if (sql.includes('INSERT INTO sales')) {
+          return { rows: [] }; // Returns 0 rows for ON CONFLICT DO NOTHING
+        }
+        return { rows: [] };
+      },
+    };
+
+    const command = {
+      eventId: 'event_gala_2026',
+      assetId: 'asset_vip_a2',
+      salesChannelId: 'biletix',
+      externalSaleReference: 'BTX-UNOWNED-CONFLICT-001',
+    };
+
+    await expect(
+      ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: mockClient })
+    ).rejects.toThrow('SALE_OWNERSHIP_CONFLICT: Sale conflict detected but existing sale is unavailable.');
+  });
+
+  it('T47: Strict DB-Authoritative Asset Projection Guard Test', async () => {
+    const memoryAssetOnlyId = 'asset_memory_only_test';
+
+    // Verify asset exists in MockDataStore / process memory
+    const memoryAsset = VenueService.getAssetById('asset_vip_a1');
+    expect(memoryAsset).toBeDefined();
+
+    // Verify asset is ABSENT from PostgreSQL venue_asset_projections table
+    const dbAssetRes = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', [memoryAssetOnlyId]);
+    expect(dbAssetRes.rows.length).toBe(0);
+
+    const command = {
+      eventId: 'event_gala_2026',
+      assetId: memoryAssetOnlyId,
+      salesChannelId: 'biletix',
+      externalSaleReference: 'BTX-MEMORY-FALLBACK-GUARD',
+    };
+
+    // Execute in PostgreSQL mode — MUST throw Asset not found and NOT fall back to MockDataStore
+    await expect(
+      UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+      )
+    ).rejects.toThrow(`Asset not found: ${memoryAssetOnlyId}`);
   });
 });

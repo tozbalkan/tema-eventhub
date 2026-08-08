@@ -41,14 +41,16 @@ export interface ProcessExternalSaleConfirmationResult {
  * 
  * Production Transaction Flow (Multi-Asset Deterministic Deadlock-Free Pattern):
  * 1. Command Idempotency Check (SELECT existing sale for channel + reference)
- * 2. Database-Authoritative Asset existence & status pre-validation via venue_asset_projections
- * 3. Non-Aborting Sale Ownership Reservation FIRST (INSERT INTO sales ON CONFLICT DO NOTHING RETURNING id)
+ * 2. Database-Authoritative Asset existence & status pre-validation via venue_asset_projections (No Memory Fallback in PG Mode)
+ * 3. Accurate Heterogeneous Pricing (Sum of base_price across all requested asset projections)
+ * 4. Non-Aborting Sale Ownership Reservation FIRST (INSERT INTO sales ON CONFLICT DO NOTHING RETURNING id)
  *    - If duplicate detected: Return existing sale payload WITHOUT mutating asset projections (Zero Phantom Side-Effects!)
- * 4. Deterministic Asset Lock Ordering (sortedAssetIds = Array.from(new Set(assetIds)).sort()) & Acquisition ONLY IF sale ownership was won!
+ *    - If conflict occurs but row is uncommitted/unavailable: Throw SALE_OWNERSHIP_CONFLICT to prevent un-owned sale fallthrough
+ * 5. Deterministic Asset Lock Ordering (sortedAssetIds = Array.from(new Set(assetIds)).sort()) & Acquisition ONLY IF sale ownership was won!
  *    - Input array deduplicated to prevent duplicate line self-lock conflicts.
- *    - If any asset is already sold: Throw SEAT_ALREADY_RESERVED (triggers UnitOfWork ROLLBACK of step 3 sale insert)
- * 5. Persist Sale Lines & OutboxMessage in SAME PostgreSQL Transaction
- * 6. UnitOfWork commits cleanly without 23505 transaction abortion or deadlock hazards
+ *    - If any asset is already sold: Throw SEAT_ALREADY_RESERVED (triggers UnitOfWork ROLLBACK of step 4 sale insert)
+ * 6. Persist Sale Lines & OutboxMessage in SAME PostgreSQL Transaction
+ * 7. UnitOfWork commits cleanly without 23505 transaction abortion or deadlock hazards
  */
 export class ProcessExternalSaleConfirmationUseCase {
   public static async execute(cmd: ProcessExternalSaleConfirmationCommand): Promise<ProcessExternalSaleConfirmationResult> {
@@ -74,7 +76,8 @@ export class ProcessExternalSaleConfirmationUseCase {
         return this.reconstructDuplicateSaleResponse(client, existingSaleRes.rows[0], cmd);
       }
 
-      // 2. Database-Authoritative Asset Validation (P1-1 Fix): Query venue_asset_projections directly in PostgreSQL!
+      // 2. Database-Authoritative Asset Validation: Query venue_asset_projections directly in PostgreSQL!
+      // In PG transaction mode, asset MUST exist in PostgreSQL venue_asset_projections table (No Memory Fallback).
       const assetProjections: Array<{ asset_id: string; name: string; category: string; status: string; base_price: number; currency: CurrencyCode }> = [];
 
       for (const currentAssetId of uniqueAssetIds) {
@@ -83,33 +86,19 @@ export class ProcessExternalSaleConfirmationUseCase {
           [currentAssetId]
         );
 
-        let assetObj: { asset_id: string; name: string; category: string; status: string; base_price: number; currency: CurrencyCode };
-
-        if (dbAssetRes.rows.length > 0) {
-          const row = dbAssetRes.rows[0];
-          assetObj = {
-            asset_id: row.asset_id,
-            name: row.name,
-            category: row.category || 'VIP',
-            status: row.status,
-            base_price: parseFloat(row.base_price || '0'),
-            currency: 'TRY', // Default currency for projections
-          };
-        } else {
-          // Fallback to memory store if present in legacy test fixtures
-          const mockAsset = VenueService.getAssetById(currentAssetId);
-          if (!mockAsset) {
-            throw new Error(`Asset not found: ${currentAssetId}`);
-          }
-          assetObj = {
-            asset_id: mockAsset.id,
-            name: mockAsset.name,
-            category: mockAsset.category || 'VIP',
-            status: mockAsset.status,
-            base_price: mockAsset.pricing.basePrice,
-            currency: (mockAsset.pricing.currency as CurrencyCode) || 'TRY',
-          };
+        if (dbAssetRes.rows.length === 0) {
+          throw new Error(`Asset not found: ${currentAssetId}`);
         }
+
+        const row = dbAssetRes.rows[0];
+        const assetObj = {
+          asset_id: row.asset_id,
+          name: row.name,
+          category: row.category || 'VIP',
+          status: row.status,
+          base_price: parseFloat(row.base_price || '0'),
+          currency: 'TRY' as CurrencyCode,
+        };
 
         if (assetObj.status === 'Sold') {
           const doubleCheckCommitted = await client.query(
@@ -126,9 +115,12 @@ export class ProcessExternalSaleConfirmationUseCase {
       }
 
       const primaryAsset = assetProjections[0]!;
-      const unitPrice = primaryAsset.base_price;
       const currency: CurrencyCode = primaryAsset.currency || 'TRY';
-      const grossPrice = unitPrice * uniqueAssetIds.length;
+
+      // 3. Accurate Heterogeneous Pricing Calculation: Sum exact base_price of all requested asset projections
+      const grossPrice = assetProjections.reduce((sum, p) => sum + p.base_price, 0);
+      const totalTaxAmount = assetProjections.reduce((sum, p) => sum + p.base_price * 0.2, 0);
+
       const defaultChannel: SalesChannel = { id: 'desk', name: 'Organizasyon Masası', commissionPercentage: 0.0, isArchived: false };
       const channel = MockDataStore.salesChannels.find((c) => c.id === cmd.salesChannelId) ?? defaultChannel;
       const commissionRate = channel.commissionPercentage / 100;
@@ -186,7 +178,7 @@ export class ProcessExternalSaleConfirmationUseCase {
           organizerAmount: { minorUnits: BigInt(Math.round(netRevenue * 100)), currency, scale: 100 },
           platformCommission: { minorUnits: BigInt(Math.round(commissionPaid * 100)), currency, scale: 100 },
           gatewayFee: { minorUnits: BigInt(0), currency, scale: 100 },
-          taxAmount: { minorUnits: BigInt(Math.round(grossPrice * 0.2 * 100)), currency, scale: 100 },
+          taxAmount: { minorUnits: BigInt(Math.round(totalTaxAmount * 100)), currency, scale: 100 },
         },
         status: 'Completed',
         notes: 'PostgreSQL sale record',
@@ -196,7 +188,7 @@ export class ProcessExternalSaleConfirmationUseCase {
         updatedAt: nowISO,
       };
 
-      // 3. Non-Aborting SQL Sale Ownership Reservation: ON CONFLICT DO NOTHING RETURNING id
+      // 4. Non-Aborting SQL Sale Ownership Reservation: ON CONFLICT DO NOTHING RETURNING id
       const saleQuery = `
         INSERT INTO sales (
           id, organization_id, event_id, reservation_id, sales_channel_id,
@@ -232,9 +224,10 @@ export class ProcessExternalSaleConfirmationUseCase {
         if (fetchExisting.rows.length > 0) {
           return this.reconstructDuplicateSaleResponse(client, fetchExisting.rows[0], cmd);
         }
+        throw new Error('SALE_OWNERSHIP_CONFLICT: Sale conflict detected but existing sale is unavailable.');
       }
 
-      // 4. REAL Multi-Asset Deterministic Lock Ordering (P1-2 Fix): Sort unique asset IDs deterministically BEFORE acquiring locks!
+      // 5. REAL Multi-Asset Deterministic Lock Ordering (P1-2 Fix): Sort unique asset IDs deterministically BEFORE acquiring locks!
       const sortedAssetIds = [...uniqueAssetIds].sort();
       for (const assetIdToLock of sortedAssetIds) {
         const assetProj = assetProjections.find((p) => p.asset_id === assetIdToLock);
@@ -256,14 +249,14 @@ export class ProcessExternalSaleConfirmationUseCase {
           assetProj?.category || 'VIP',
           sale.id,
           sale.reservationId,
-          assetProj?.base_price || unitPrice,
+          assetProj?.base_price || 0,
         ]);
         if (lockRes.rowCount === 0) {
           throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
         }
       }
 
-      // 5. INSERT Sale lines into PostgreSQL in SAME transaction
+      // 6. INSERT Sale lines into PostgreSQL in SAME transaction
       for (const line of sale.lines) {
         const lineQuery = `
           INSERT INTO sale_lines (id, sale_id, venue_asset_id, quantity, unit_price, total_price)
@@ -272,7 +265,7 @@ export class ProcessExternalSaleConfirmationUseCase {
         await client.query(lineQuery, [line.id, sale.id, line.venueAssetId, line.unitPrice]);
       }
 
-      // 6. INSERT OutboxMessage into PostgreSQL in SAME transaction
+      // 7. INSERT OutboxMessage into PostgreSQL in SAME transaction
       const event: SaleRecordedDomainEvent = {
         eventName: DomainEventNames.SaleRecorded,
         header: {
