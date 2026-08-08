@@ -18,7 +18,7 @@ import { MockDataStore } from '@/repositories/mock/MockRepositories';
 import fs from 'fs';
 import path from 'path';
 
-describe('PostgreSQL Correctness Baseline (T1 - T57 Integration Tests)', () => {
+describe('PostgreSQL Correctness Baseline (T1 - T62 Integration Tests)', () => {
   let pool: Pool;
 
   beforeAll(async () => {
@@ -1877,5 +1877,369 @@ describe('PostgreSQL Correctness Baseline (T1 - T57 Integration Tests)', () => {
 
     expect(salesDb.rows.length).toBe(1);
     expect(resDb.rows[0].status).toBe('ConvertedToSale');
+  });
+
+  it('T58: Cancel vs Conversion Race Test (100 Concurrent Parallel Workers)', async () => {
+    const assetId = 'asset_vip_a1';
+    const reservation = await UnitOfWork.execute((tx) =>
+      ReservationService.createReservationPg(tx, {
+        eventId: 'event_gala_2026',
+        assetId,
+        customerName: 'Race User',
+        customerPhone: '5559998877',
+        customerEmail: 'race@example.com',
+        guestCountPax: 4,
+      })
+    );
+
+    // Concurrently launch 50 cancel tasks vs 50 conversion tasks
+    const cancelTasks = Array.from({ length: 50 }, () =>
+      UnitOfWork.execute((tx) => ReservationService.cancelReservationPg(tx, reservation.id, 'CUSTOMER'))
+        .catch((err: Error) => ({ error: err.message }))
+    );
+
+    const convertTasks = Array.from({ length: 50 }, (idx) =>
+      UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({
+          eventId: 'event_gala_2026',
+          assetId,
+          reservationId: reservation.id,
+          salesChannelId: 'biletix',
+          externalSaleReference: `BTX-CANCEL-CONVERT-RACE-${idx}`,
+          purchaserEmail: 'race@example.com',
+          pgClient: tx,
+        })
+      ).catch((err: Error) => ({ error: err.message }))
+    );
+
+    const results = await Promise.all([...cancelTasks, ...convertTasks]);
+
+    // Query final state in PostgreSQL
+    const resDb = await pool.query('SELECT * FROM reservations WHERE id = $1', [reservation.id]);
+    const projDb = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', [assetId]);
+
+    const finalResStatus = resDb.rows[0].status;
+    const finalProjStatus = projDb.rows[0].status;
+
+    // Assert DETERMINISTIC MUTUAL EXCLUSION:
+    // Either (Cancelled + Available) OR (ConvertedToSale + Sold)
+    const isValidCancelled = finalResStatus === 'Cancelled' && finalProjStatus === 'Available';
+    const isValidConverted = finalResStatus === 'ConvertedToSale' && finalProjStatus === 'Sold';
+
+    expect(isValidCancelled || isValidConverted).toBe(true);
+
+    // Assert ZERO invalid cross-states exist (e.g. Cancelled + Sold or ConvertedToSale + Available)
+    expect(finalResStatus === 'Cancelled' && finalProjStatus === 'Sold').toBe(false);
+    expect(finalResStatus === 'ConvertedToSale' && finalProjStatus === 'Available').toBe(false);
+  });
+
+  it('T59: Cancel vs Expiration Race Test', async () => {
+    const assetId = 'asset_vip_a2';
+    const resId = IdGenerator.generateUUIDv7();
+    const nowISO = new Date().toISOString();
+    const pastExpISO = new Date(Date.now() - 3600000).toISOString();
+
+    await pool.query(
+      `INSERT INTO reservations (id, organization_id, event_id, asset_id, customer_id, customer_name, customer_phone, customer_email, guest_count_pax, status, expiration_date, created_at, updated_at)
+       VALUES ($1, 'org_01', 'event_gala_2026', $2, $3, 'Exp/Cancel Holder', '555', 'expcancel@test.com', 4, 'Confirmed', $4, $5, $5);`,
+      [resId, assetId, IdGenerator.generateUUIDv7(), pastExpISO, nowISO]
+    );
+
+    await pool.query(
+      `UPDATE venue_asset_projections SET status = 'Reserved', occupancy_state = 'Reserved', reservation_id = $1 WHERE asset_id = $2`,
+      [resId, assetId]
+    );
+
+    // Concurrently launch cancel vs expiration worker
+    const cancelTask = UnitOfWork.execute((tx) => ReservationService.cancelReservationPg(tx, resId, 'CUSTOMER'))
+      .catch((err: Error) => ({ error: err.message }));
+    const expireTask = UnitOfWork.execute((tx) => ReservationService.expireReservationsPg(tx))
+      .catch((err: Error) => ({ error: err.message }));
+
+    await Promise.all([cancelTask, expireTask]);
+
+    const resDb = await pool.query('SELECT * FROM reservations WHERE id = $1', [resId]);
+    const projDb = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', [assetId]);
+
+    const finalResStatus = resDb.rows[0].status;
+    const finalProjStatus = projDb.rows[0].status;
+
+    // Assert state machine invariant: Final asset status MUST be 'Available' and reservation status MUST be 'Cancelled' or 'Expired'
+    expect(finalProjStatus).toBe('Available');
+    expect(finalResStatus === 'Cancelled' || finalResStatus === 'Expired').toBe(true);
+    expect(finalResStatus).not.toBe('Reserved');
+  });
+
+  it('T60: Expiration vs Conversion Stress Race Test (100 Concurrent Parallel Workers)', async () => {
+    const assetId = 'asset_vip_a3';
+    const resId = IdGenerator.generateUUIDv7();
+    const nowISO = new Date().toISOString();
+    const pastExpISO = new Date(Date.now() - 3600000).toISOString();
+
+    await pool.query(
+      `INSERT INTO reservations (id, organization_id, event_id, asset_id, customer_id, customer_name, customer_phone, customer_email, guest_count_pax, status, expiration_date, created_at, updated_at)
+       VALUES ($1, 'org_01', 'event_gala_2026', $2, $3, 'Exp/Convert Holder', '555', 'expconvert@test.com', 4, 'Confirmed', $4, $5, $5);`,
+      [resId, assetId, IdGenerator.generateUUIDv7(), pastExpISO, nowISO]
+    );
+
+    await pool.query(
+      `UPDATE venue_asset_projections SET status = 'Reserved', occupancy_state = 'Reserved', reservation_id = $1 WHERE asset_id = $2`,
+      [resId, assetId]
+    );
+
+    // 50 Expiration Workers vs 50 Conversion Attempts
+    const expireTasks = Array.from({ length: 50 }, () =>
+      UnitOfWork.execute((tx) => ReservationService.expireReservationsPg(tx))
+        .catch((err: Error) => ({ error: err.message }))
+    );
+
+    const convertTasks = Array.from({ length: 50 }, (idx) =>
+      UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({
+          eventId: 'event_gala_2026',
+          assetId,
+          reservationId: resId,
+          salesChannelId: 'biletix',
+          externalSaleReference: `BTX-EXP-CONVERT-RACE-${idx}`,
+          purchaserEmail: 'expconvert@test.com',
+          pgClient: tx,
+        })
+      ).catch((err: Error) => ({ error: err.message }))
+    );
+
+    await Promise.all([...expireTasks, ...convertTasks]);
+
+    const resDb = await pool.query('SELECT * FROM reservations WHERE id = $1', [resId]);
+    const projDb = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', [assetId]);
+
+    const finalResStatus = resDb.rows[0].status;
+    const finalProjStatus = projDb.rows[0].status;
+
+    // Assert EXACTLY ONE VALID TERMINAL STATE:
+    // (Expired + Available) OR (ConvertedToSale + Sold)
+    const isValidExpired = finalResStatus === 'Expired' && finalProjStatus === 'Available';
+    const isValidConverted = finalResStatus === 'ConvertedToSale' && finalProjStatus === 'Sold';
+
+    expect(isValidExpired || isValidConverted).toBe(true);
+  });
+
+  it('T61: Uniform Lock Ordering & Deadlock Prevention Stress Test', async () => {
+    // Shared asset pool across 4 concurrent operational types (Create, Cancel, Expire, Convert)
+    const assets = ['asset_vip_a1', 'asset_vip_a2', 'asset_vip_a3', 'asset_bistro_b1'];
+
+    // Seed 4 initial reservations
+    const reservations = await Promise.all(
+      assets.map((assetId, idx) =>
+        UnitOfWork.execute((tx) =>
+          ReservationService.createReservationPg(tx, {
+            eventId: 'event_gala_2026',
+            assetId,
+            customerName: `Stress User ${idx}`,
+            customerPhone: `555000${idx}`,
+            customerEmail: `stress${idx}@example.com`,
+            guestCountPax: 2,
+          })
+        )
+      )
+    );
+
+    const tasks: Promise<any>[] = [];
+
+    // Launch mixed operations concurrently against overlapping assets
+    reservations.forEach((res, idx) => {
+      // Cancel task
+      tasks.push(
+        UnitOfWork.execute((tx) => ReservationService.cancelReservationPg(tx, res.id, 'CUSTOMER'))
+          .then((r) => ({ cancelResult: r }))
+          .catch((err: Error) => ({ error: err.message }))
+      );
+      // Expire task
+      tasks.push(
+        UnitOfWork.execute((tx) => ReservationService.expireReservationsPg(tx))
+          .then((count) => ({ expiredCount: count }))
+          .catch((err: Error) => ({ error: err.message }))
+      );
+      // Convert task
+      tasks.push(
+        UnitOfWork.execute((tx) =>
+          ProcessExternalSaleConfirmationUseCase.execute({
+            eventId: 'event_gala_2026',
+            assetId: res.assetId,
+            reservationId: res.id,
+            salesChannelId: 'biletix',
+            externalSaleReference: `STRESS-CONVERT-${idx}`,
+            purchaserEmail: `stress${idx}@example.com`,
+            pgClient: tx,
+          })
+        ).catch((err: Error) => ({ error: err.message }))
+      );
+    });
+
+    const results = await Promise.all(tasks);
+    const errors = results.filter((r) => typeof r === 'object' && r !== null && 'error' in r).map((r: any) => r.error);
+
+    // 1. Assert ZERO PostgreSQL "deadlock detected" errors!
+    const hasDeadlockError = errors.some((e) => e.toLowerCase().includes('deadlock'));
+    expect(hasDeadlockError).toBe(false);
+
+    // 2. Verify all asset projections remain in valid terminal states (Available, Sold, or Reserved)
+    for (const assetId of assets) {
+      const projDb = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', [assetId]);
+      const status = projDb.rows[0].status;
+      expect(status === 'Available' || status === 'Sold' || status === 'Reserved').toBe(true);
+    }
+  });
+
+  it('T62: Reservation State Transition Exhaustive Matrix Test', async () => {
+    // 1. Available -> Create (Allowed)
+    const resAvailable = await UnitOfWork.execute((tx) =>
+      ReservationService.createReservationPg(tx, {
+        eventId: 'event_gala_2026',
+        assetId: 'asset_bistro_b3',
+        customerName: 'Matrix User',
+        customerPhone: '555',
+        customerEmail: 'matrix@example.com',
+        guestCountPax: 2,
+      })
+    );
+    expect(resAvailable.status).toBe('Confirmed');
+
+    // 2. Reserved -> Create (Forbidden)
+    await expect(
+      UnitOfWork.execute((tx) =>
+        ReservationService.createReservationPg(tx, {
+          eventId: 'event_gala_2026',
+          assetId: 'asset_bistro_b3',
+          customerName: 'Double Book',
+          customerPhone: '555',
+          customerEmail: 'double@example.com',
+          guestCountPax: 2,
+        })
+      )
+    ).rejects.toThrow('SEAT_ALREADY_RESERVED');
+
+    // 3. Sold -> Create (Forbidden)
+    await pool.query(`UPDATE venue_asset_projections SET status = 'Sold' WHERE asset_id = 'asset_bistro_b4'`);
+    await expect(
+      UnitOfWork.execute((tx) =>
+        ReservationService.createReservationPg(tx, {
+          eventId: 'event_gala_2026',
+          assetId: 'asset_bistro_b4',
+          customerName: 'Sold Book',
+          customerPhone: '555',
+          customerEmail: 'sold@example.com',
+          guestCountPax: 2,
+        })
+      )
+    ).rejects.toThrow('SEAT_ALREADY_RESERVED');
+
+    // 4. Blocked -> Create (Forbidden)
+    await pool.query(`UPDATE venue_asset_projections SET status = 'Blocked' WHERE asset_id = 'asset_vip_a4'`);
+    await expect(
+      UnitOfWork.execute((tx) =>
+        ReservationService.createReservationPg(tx, {
+          eventId: 'event_gala_2026',
+          assetId: 'asset_vip_a4',
+          customerName: 'Blocked Book',
+          customerPhone: '555',
+          customerEmail: 'blocked@example.com',
+          guestCountPax: 2,
+        })
+      )
+    ).rejects.toThrow('SEAT_BLOCKED');
+
+    // 5. Confirmed -> Convert (Allowed)
+    const convertRes = await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({
+        eventId: 'event_gala_2026',
+        assetId: 'asset_bistro_b3',
+        reservationId: resAvailable.id,
+        salesChannelId: 'biletix',
+        externalSaleReference: 'MATRIX-CONVERT-001',
+        purchaserEmail: 'matrix@example.com',
+        pgClient: tx,
+      })
+    );
+    expect(convertRes.isDuplicateRecord).toBe(false);
+
+    // 6. Confirmed -> Cancel (Allowed for new confirmed reservation)
+    const resToCancel = await UnitOfWork.execute((tx) =>
+      ReservationService.createReservationPg(tx, {
+        eventId: 'event_gala_2026',
+        assetId: 'asset_vip_a1',
+        customerName: 'Cancel Test',
+        customerPhone: '555',
+        customerEmail: 'cancel@example.com',
+        guestCountPax: 2,
+      })
+    );
+    const cancelRes = await UnitOfWork.execute((tx) => ReservationService.cancelReservationPg(tx, resToCancel.id, 'CUSTOMER'));
+    expect(cancelRes.status).toBe('Cancelled');
+
+    // 7. Expired -> Convert (Forbidden)
+    const expResId = IdGenerator.generateUUIDv7();
+    const pastExpISO = new Date(Date.now() - 3600000).toISOString();
+    await pool.query(
+      `INSERT INTO reservations (id, organization_id, event_id, asset_id, customer_id, customer_name, customer_phone, customer_email, guest_count_pax, status, expiration_date, created_at, updated_at)
+       VALUES ($1, 'org_01', 'event_gala_2026', 'asset_vip_a2', $2, 'Expired User', '555', 'exp@test.com', 2, 'Expired', $3, NOW(), NOW());`,
+      [expResId, IdGenerator.generateUUIDv7(), pastExpISO]
+    );
+    await expect(
+      UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({
+          eventId: 'event_gala_2026',
+          assetId: 'asset_vip_a2',
+          reservationId: expResId,
+          salesChannelId: 'biletix',
+          externalSaleReference: 'FAIL-EXP-CONVERT',
+          purchaserEmail: 'exp@test.com',
+          pgClient: tx,
+        })
+      )
+    ).rejects.toThrow('RESERVATION_EXPIRED');
+
+    // 8. Cancelled -> Convert (Forbidden)
+    await expect(
+      UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({
+          eventId: 'event_gala_2026',
+          assetId: 'asset_vip_a1',
+          reservationId: resToCancel.id,
+          salesChannelId: 'biletix',
+          externalSaleReference: 'FAIL-CANCEL-CONVERT',
+          purchaserEmail: 'cancel@example.com',
+          pgClient: tx,
+        })
+      )
+    ).rejects.toThrow('RESERVATION_CANCELLED');
+
+    // 9. ConvertedToSale -> Convert (Idempotent duplicate response)
+    const dupRes = await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({
+        eventId: 'event_gala_2026',
+        assetId: 'asset_bistro_b3',
+        reservationId: resAvailable.id,
+        salesChannelId: 'biletix',
+        externalSaleReference: 'MATRIX-CONVERT-001',
+        purchaserEmail: 'matrix@example.com',
+        pgClient: tx,
+      })
+    );
+    expect(dupRes.isDuplicateRecord).toBe(true);
+
+    // 10. Cancelled -> Cancel (Forbidden)
+    await expect(
+      UnitOfWork.execute((tx) => ReservationService.cancelReservationPg(tx, resToCancel.id, 'CUSTOMER'))
+    ).rejects.toThrow('RESERVATION_ALREADY_CLOSED');
+
+    // 11. Expired -> Cancel (Forbidden)
+    await expect(
+      UnitOfWork.execute((tx) => ReservationService.cancelReservationPg(tx, expResId, 'CUSTOMER'))
+    ).rejects.toThrow('RESERVATION_ALREADY_CLOSED');
+
+    // 12. ConvertedToSale -> Cancel (Forbidden)
+    await expect(
+      UnitOfWork.execute((tx) => ReservationService.cancelReservationPg(tx, resAvailable.id, 'CUSTOMER'))
+    ).rejects.toThrow('RESERVATION_ALREADY_CONVERTED');
   });
 });

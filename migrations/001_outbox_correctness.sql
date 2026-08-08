@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS sale_lines (
 
 CREATE INDEX IF NOT EXISTS idx_sale_lines_sale_id ON sale_lines (sale_id);
 
--- Reservations Table (Aggregate Persistence & Reservation Holds)
+-- Reservations Table (Aggregate Persistence & Reservation Holds with Status CHECK Constraint)
 CREATE TABLE IF NOT EXISTS reservations (
   id                  UUID PRIMARY KEY,
   organization_id     VARCHAR(100) NOT NULL,
@@ -97,7 +97,7 @@ CREATE TABLE IF NOT EXISTS reservations (
   customer_phone      VARCHAR(50),
   customer_email      VARCHAR(200),
   guest_count_pax     INT NOT NULL DEFAULT 1,
-  status              VARCHAR(30) NOT NULL DEFAULT 'Confirmed',
+  status              VARCHAR(30) NOT NULL DEFAULT 'Confirmed' CHECK (status IN ('Confirmed', 'Cancelled', 'Expired', 'ConvertedToSale')),
   cancellation_reason VARCHAR(50),
   expiration_date     TIMESTAMPTZ NOT NULL,
   version             INT NOT NULL DEFAULT 1,

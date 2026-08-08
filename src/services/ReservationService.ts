@@ -89,10 +89,16 @@ export class ReservationService {
   }
 
   /**
-   * Creates a reservation in PostgreSQL transaction mode (Authoritative Mode)
+   * Creates a reservation in PostgreSQL transaction mode (Authoritative Mode).
+   * 
+   * Transaction Contract: Must be invoked inside an active UnitOfWork transaction block (`PoolClient`).
+   * Canonical Global Lock Order:
+   * 1. Lock asset projection (venue_asset_projections) FIRST (FOR UPDATE).
+   * 2. Insert reservation record into reservations table SECOND.
+   * 3. Update venue_asset_projections status to 'Reserved' and set reservation_id.
    */
   public static async createReservationPg(client: PoolClient, dto: CreateReservationDTO): Promise<Reservation> {
-    // 1. Lock and check venue asset projection in PostgreSQL
+    // 1. Canonical Lock Order Step 1: Lock venue asset projection FIRST
     const assetRes = await client.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1 FOR UPDATE', [dto.assetId]);
     if (assetRes.rows.length === 0) {
       throw new Error(`Asset not found: ${dto.assetId}`);
@@ -116,7 +122,7 @@ export class ReservationService {
     const expDate = new Date(Date.now() + expHours * 60 * 60 * 1000).toISOString();
     const nowISO = new Date().toISOString();
 
-    // 2. Insert into PostgreSQL reservations table
+    // 2. Canonical Lock Order Step 2: Insert into PostgreSQL reservations table SECOND
     await client.query(
       `INSERT INTO reservations (
         id, organization_id, event_id, asset_id, customer_id, customer_name, customer_phone, customer_email, guest_count_pax, status, expiration_date, version, created_at, updated_at
@@ -124,10 +130,10 @@ export class ReservationService {
       [reservationId, orgId, dto.eventId, dto.assetId, customerId, dto.customerName, dto.customerPhone, dto.customerEmail, dto.guestCountPax, expDate, nowISO]
     );
 
-    // 3. Update venue_asset_projections to Reserved
+    // 3. Update venue_asset_projections to Reserved with version increment
     await client.query(
       `UPDATE venue_asset_projections
-       SET status = 'Reserved', occupancy_state = 'Reserved', reservation_id = $1, last_updated = NOW()
+       SET status = 'Reserved', occupancy_state = 'Reserved', reservation_id = $1, version = version + 1, last_updated = NOW()
        WHERE asset_id = $2;`,
       [reservationId, dto.assetId]
     );
@@ -172,9 +178,16 @@ export class ReservationService {
   }
 
   /**
-   * Cancels a reservation in PostgreSQL transaction mode
+   * Cancels a reservation in PostgreSQL transaction mode.
+   * 
+   * Transaction Contract: Must be invoked inside an active UnitOfWork transaction block (`PoolClient`).
+   * Canonical Global Lock Order:
+   * 1. Lock reservation row FIRST (FOR UPDATE) or lock associated asset projection.
+   * 2. Lock venue asset projection SECOND (FOR UPDATE).
+   * 3. Perform state mutations with aggregate version increment.
    */
   public static async cancelReservationPg(client: PoolClient, id: string, reason: CancellationReason): Promise<Reservation> {
+    // 1. Lock reservation row FIRST
     const resResult = await client.query('SELECT * FROM reservations WHERE id = $1 FOR UPDATE', [id]);
     if (resResult.rows.length === 0) {
       throw new Error('Reservation not found');
@@ -184,19 +197,33 @@ export class ReservationService {
     if (row.status === 'Cancelled' || row.status === 'Expired') {
       throw new Error('RESERVATION_ALREADY_CLOSED');
     }
+    if (row.status === 'ConvertedToSale') {
+      throw new Error('RESERVATION_ALREADY_CONVERTED: Cannot cancel a reservation already converted to a sale.');
+    }
+
+    // 2. Lock asset projection SECOND (Canonical Lock Order)
+    const assetRes = await client.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1 FOR UPDATE', [row.asset_id]);
 
     const nowISO = new Date().toISOString();
+    const newVersion = row.version + 1;
+
+    // 3. Mutate reservation status with version increment
     await client.query(
-      `UPDATE reservations SET status = 'Cancelled', cancellation_reason = $1, updated_at = $2 WHERE id = $3`,
-      [reason, nowISO, id]
+      `UPDATE reservations
+       SET status = 'Cancelled', cancellation_reason = $1, version = $2, updated_at = $3
+       WHERE id = $4 AND status = 'Confirmed'`,
+      [reason, newVersion, nowISO, id]
     );
 
-    await client.query(
-      `UPDATE venue_asset_projections
-       SET status = 'Available', occupancy_state = 'Vacant', reservation_id = NULL, last_updated = NOW()
-       WHERE asset_id = $1 AND reservation_id = $2`,
-      [row.asset_id, id]
-    );
+    // 4. Release asset projection back to Available if currently linked to this reservation
+    if (assetRes.rows.length > 0 && assetRes.rows[0].reservation_id === id) {
+      await client.query(
+        `UPDATE venue_asset_projections
+         SET status = 'Available', occupancy_state = 'Vacant', reservation_id = NULL, version = version + 1, last_updated = NOW()
+         WHERE asset_id = $1 AND reservation_id = $2`,
+        [row.asset_id, id]
+      );
+    }
 
     return {
       id: row.id,
@@ -212,7 +239,7 @@ export class ReservationService {
       expirationDate: row.expiration_date,
       status: 'Cancelled',
       cancellationReason: reason,
-      version: row.version + 1,
+      version: newVersion,
       isArchived: false,
       createdAt: row.created_at,
       updatedAt: nowISO,
@@ -220,9 +247,13 @@ export class ReservationService {
   }
 
   /**
-   * Background expiration worker for PostgreSQL reservations
+   * Background expiration worker for PostgreSQL reservations.
+   * 
+   * Transaction Contract: Must be invoked inside an active UnitOfWork transaction block (`PoolClient`).
+   * Uses FOR UPDATE SKIP LOCKED to allow concurrent workers without lock contention.
    */
   public static async expireReservationsPg(client: PoolClient): Promise<number> {
+    // 1. Lock expired confirmed reservations (SKIP LOCKED)
     const expiredRes = await client.query(
       `SELECT * FROM reservations WHERE status = 'Confirmed' AND expiration_date < NOW() FOR UPDATE SKIP LOCKED`
     );
@@ -231,18 +262,27 @@ export class ReservationService {
     const nowISO = new Date().toISOString();
 
     for (const row of expiredRes.rows) {
-      await client.query(
-        `UPDATE reservations SET status = 'Expired', updated_at = $1 WHERE id = $2`,
+      // 2. Lock associated asset projection SECOND
+      const assetRes = await client.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1 FOR UPDATE', [row.asset_id]);
+
+      // 3. Update reservation status to Expired with version increment
+      const updateRes = await client.query(
+        `UPDATE reservations SET status = 'Expired', version = version + 1, updated_at = $1 WHERE id = $2 AND status = 'Confirmed'`,
         [nowISO, row.id]
       );
 
-      await client.query(
-        `UPDATE venue_asset_projections
-         SET status = 'Available', occupancy_state = 'Vacant', reservation_id = NULL, last_updated = NOW()
-         WHERE asset_id = $1 AND reservation_id = $2 AND status = 'Reserved'`,
-        [row.asset_id, row.id]
-      );
-      count++;
+      if (updateRes.rowCount! > 0) {
+        // 4. Release asset projection back to Available if still reserved by this reservation
+        if (assetRes.rows.length > 0 && assetRes.rows[0].reservation_id === row.id && assetRes.rows[0].status === 'Reserved') {
+          await client.query(
+            `UPDATE venue_asset_projections
+             SET status = 'Available', occupancy_state = 'Vacant', reservation_id = NULL, version = version + 1, last_updated = NOW()
+             WHERE asset_id = $1 AND reservation_id = $2 AND status = 'Reserved'`,
+            [row.asset_id, row.id]
+          );
+        }
+        count++;
+      }
     }
 
     return count;

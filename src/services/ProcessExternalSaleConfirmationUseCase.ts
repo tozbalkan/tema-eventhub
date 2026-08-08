@@ -43,18 +43,19 @@ export interface ProcessExternalSaleConfirmationResult {
  * 
  * PostgreSQL Transaction Flow (Multi-Asset Deterministic Deadlock-Free Pattern + Reservation Hold Protection):
  * 1. Command Idempotency Check (SELECT existing sale for channel + reference)
- * 2. Database-Authoritative Asset & Channel Validation (Query venue_asset_projections & sales_channels directly in PostgreSQL)
- *    - Check Reservation Hold Ownership & Expiration (Reject unauthorized or expired reservation conversion attempts)
- * 3. Command-Supplied Tenant Identity (organizationId passed via command payload, persisted transactionally)
- * 4. Heterogeneous Asset Pricing & VAT-Exclusive Tax Calculation (Sum of base_price across all requested asset projections; 20% KDV on net base_price)
- * 5. Non-Aborting Sale Ownership Reservation FIRST (INSERT INTO sales ON CONFLICT DO NOTHING RETURNING id)
+ * 2. Reservation Guard: If reservationId is supplied, lock and validate reservation record from PostgreSQL FIRST
+ * 3. Database-Authoritative Asset & Channel Validation in CANONICAL SORTED ASSET ORDER (sortedAssetIds = [...uniqueAssetIds].sort())
+ *    - Query venue_asset_projections directly in PostgreSQL with FOR UPDATE in sorted order to prevent cross-lock deadlocks
+ * 4. Command-Supplied Tenant Identity (organizationId passed via command payload, persisted transactionally)
+ * 5. Heterogeneous Asset Pricing & VAT-Exclusive Tax Calculation (Sum of base_price across all requested asset projections; 20% KDV on net base_price)
+ * 6. Non-Aborting Sale Ownership Reservation FIRST (INSERT INTO sales ON CONFLICT DO NOTHING RETURNING id)
  *    - If duplicate detected: Return existing sale payload WITHOUT mutating asset projections (Zero Phantom Side-Effects!)
  *    - If conflict occurs but row is uncommitted/unavailable: Throw SALE_OWNERSHIP_CONFLICT to prevent un-owned sale fallthrough
- * 6. Deterministic Asset Lock Ordering (sortedAssetIds = Array.from(new Set(assetIds)).sort()) & Acquisition ONLY IF sale ownership was won!
+ * 7. Asset Status Transition to 'Sold' in CANONICAL SORTED ASSET ORDER ONLY IF sale ownership was won!
  *    - Input array deduplicated to prevent duplicate line self-lock conflicts.
- *    - If any asset is already sold (or reserved by another hold): Throw SEAT_ALREADY_RESERVED (triggers UnitOfWork ROLLBACK of step 5 sale insert)
- * 7. Update Reservation Status to 'ConvertedToSale', Persist Sale Lines & OutboxMessage in SAME PostgreSQL Transaction
- * 8. UnitOfWork commits cleanly without 23505 transaction abortion or deadlock hazards
+ *    - If any asset is already sold (or reserved by another hold): Throw SEAT_ALREADY_RESERVED (triggers UnitOfWork ROLLBACK of step 6 sale insert)
+ * 8. Update Reservation Status to 'ConvertedToSale', Persist Sale Lines & OutboxMessage in SAME PostgreSQL Transaction
+ * 9. UnitOfWork commits cleanly without 23505 transaction abortion or deadlock hazards
  */
 export class ProcessExternalSaleConfirmationUseCase {
   public static async execute(cmd: ProcessExternalSaleConfirmationCommand): Promise<ProcessExternalSaleConfirmationResult> {
@@ -65,6 +66,7 @@ export class ProcessExternalSaleConfirmationUseCase {
 
     // Deduplicate requested asset IDs for canonical lock ordering and line item processing
     const uniqueAssetIds = Array.from(new Set(requestedAssetIds));
+    const sortedAssetIds = [...uniqueAssetIds].sort();
 
     // PostgreSQL Transactional Execution Path (Database-Authoritative Asset & Channel State Mode)
     if (cmd.pgClient) {
@@ -80,12 +82,29 @@ export class ProcessExternalSaleConfirmationUseCase {
         return this.reconstructDuplicateSaleResponse(client, existingSaleRes.rows[0], cmd);
       }
 
-      // 2. Database-Authoritative Asset Validation: Query venue_asset_projections directly in PostgreSQL
-      const assetProjections: Array<{ asset_id: string; name: string; category: string; status: string; base_price: number; currency: CurrencyCode; reservation_id?: string }> = [];
+      // 2. Reservation Guard: If cmd.reservationId is supplied, lock and validate reservation record from PostgreSQL FIRST
+      if (cmd.reservationId) {
+        const resDb = await client.query('SELECT * FROM reservations WHERE id = $1 FOR UPDATE', [cmd.reservationId]);
+        if (resDb.rows.length > 0) {
+          const resData = resDb.rows[0];
+          if (resData.status === 'Expired' || new Date(resData.expiration_date).getTime() < Date.now()) {
+            throw new Error('RESERVATION_EXPIRED: Reservation hold has expired.');
+          }
+          if (resData.status === 'Cancelled') {
+            throw new Error('RESERVATION_CANCELLED: Reservation hold has been cancelled.');
+          }
+          if (cmd.purchaserEmail && resData.customer_email && cmd.purchaserEmail.toLowerCase() !== resData.customer_email.toLowerCase()) {
+            throw new Error('RESERVATION_NOT_OWNED: Purchaser email does not match reservation owner.');
+          }
+        }
+      }
 
-      for (const currentAssetId of uniqueAssetIds) {
+      // 3. Database-Authoritative Asset Validation in CANONICAL SORTED ASSET ORDER (FOR UPDATE locks acquired in sorted order!)
+      const assetProjectionsMap: Map<string, { asset_id: string; name: string; category: string; status: string; base_price: number; currency: CurrencyCode; reservation_id?: string }> = new Map();
+
+      for (const currentAssetId of sortedAssetIds) {
         const dbAssetRes = await client.query(
-          'SELECT * FROM venue_asset_projections WHERE asset_id = $1',
+          'SELECT * FROM venue_asset_projections WHERE asset_id = $1 FOR UPDATE',
           [currentAssetId]
         );
 
@@ -122,27 +141,15 @@ export class ProcessExternalSaleConfirmationUseCase {
             if (!cmd.reservationId || cmd.reservationId !== activeResId) {
               throw new Error('SEAT_ALREADY_RESERVED: Asset is currently reserved by another reservation hold.');
             }
-
-            const resDb = await client.query('SELECT * FROM reservations WHERE id = $1', [activeResId]);
-            if (resDb.rows.length > 0) {
-              const resData = resDb.rows[0];
-              if (resData.status === 'Expired' || new Date(resData.expiration_date).getTime() < Date.now()) {
-                throw new Error('RESERVATION_EXPIRED: Reservation hold has expired.');
-              }
-              if (resData.status === 'Cancelled') {
-                throw new Error('RESERVATION_CANCELLED: Reservation hold has been cancelled.');
-              }
-              if (cmd.purchaserEmail && resData.customer_email && cmd.purchaserEmail.toLowerCase() !== resData.customer_email.toLowerCase()) {
-                throw new Error('RESERVATION_NOT_OWNED: Purchaser email does not match reservation owner.');
-              }
-            }
           }
         }
 
-        assetProjections.push(assetObj);
+        assetProjectionsMap.set(currentAssetId, assetObj);
       }
 
-      // 3. Database-Authoritative SalesChannel Metadata Lookup
+      const assetProjections = uniqueAssetIds.map((id) => assetProjectionsMap.get(id)!);
+
+      // 4. Database-Authoritative SalesChannel Metadata Lookup
       const channelRes = await client.query('SELECT * FROM sales_channels WHERE id = $1', [cmd.salesChannelId]);
       let channelName = cmd.salesChannelId;
       let commissionRate = 0.0;
@@ -155,7 +162,7 @@ export class ProcessExternalSaleConfirmationUseCase {
       const primaryAsset = assetProjections[0]!;
       const currency: CurrencyCode = primaryAsset.currency || 'TRY';
 
-      // 4. Pricing & Tax Arithmetic (VAT-Exclusive Baseline: base_price + 20% KDV)
+      // 5. Pricing & Tax Arithmetic (VAT-Exclusive Baseline: base_price + 20% KDV)
       const grossPrice = assetProjections.reduce((sum, p) => sum + p.base_price, 0);
       const totalTaxAmount = assetProjections.reduce((sum, p) => sum + p.base_price * 0.2, 0);
       const commissionPaid = grossPrice * commissionRate;
@@ -170,7 +177,7 @@ export class ProcessExternalSaleConfirmationUseCase {
       const saleId = IdGenerator.generateUUIDv7();
 
       const lines: SaleLine[] = uniqueAssetIds.map((aId) => {
-        const aProj = assetProjections.find((p) => p.asset_id === aId) || primaryAsset;
+        const aProj = assetProjectionsMap.get(aId) || primaryAsset;
         const linePrice = aProj.base_price;
         const lineCurrency: CurrencyCode = aProj.currency || currency;
         return {
@@ -225,7 +232,7 @@ export class ProcessExternalSaleConfirmationUseCase {
         updatedAt: nowISO,
       };
 
-      // 5. Non-Aborting SQL Sale Ownership Reservation: ON CONFLICT DO NOTHING RETURNING id
+      // 6. Non-Aborting SQL Sale Ownership Reservation: ON CONFLICT DO NOTHING RETURNING id
       const saleQuery = `
         INSERT INTO sales (
           id, organization_id, event_id, reservation_id, sales_channel_id,
@@ -264,10 +271,9 @@ export class ProcessExternalSaleConfirmationUseCase {
         throw new Error('SALE_OWNERSHIP_CONFLICT: Sale conflict detected but existing sale is unavailable.');
       }
 
-      // 6. REAL Multi-Asset Deterministic Lock Ordering: Sort unique asset IDs deterministically BEFORE acquiring locks!
-      const sortedAssetIds = [...uniqueAssetIds].sort();
+      // 7. REAL Multi-Asset Deterministic Lock Ordering: Mutate asset projections in CANONICAL SORTED ORDER
       for (const assetIdToLock of sortedAssetIds) {
-        const assetProj = assetProjections.find((p) => p.asset_id === assetIdToLock);
+        const assetProj = assetProjectionsMap.get(assetIdToLock);
         const lockAssetQuery = `
           INSERT INTO venue_asset_projections (
             asset_id, name, category, status, occupancy_state, sale_id, reservation_id, pax_capacity, base_price, version, last_updated
@@ -279,14 +285,17 @@ export class ProcessExternalSaleConfirmationUseCase {
             version = venue_asset_projections.version + 1,
             last_updated = NOW()
           WHERE venue_asset_projections.status <> 'Sold'
-            AND (venue_asset_projections.reservation_id IS NULL OR venue_asset_projections.reservation_id = $5 OR $5 IS NOT NULL);
+            AND (
+              venue_asset_projections.reservation_id IS NULL
+              OR venue_asset_projections.reservation_id = $5
+            );
         `;
         const lockRes = await client.query(lockAssetQuery, [
           assetIdToLock,
           assetProj?.name || 'Venue Asset',
           assetProj?.category || 'VIP',
           sale.id,
-          sale.reservationId,
+          sale.reservationId || null,
           assetProj?.base_price || 0,
         ]);
         if (lockRes.rowCount === 0) {
@@ -294,15 +303,15 @@ export class ProcessExternalSaleConfirmationUseCase {
         }
       }
 
-      // If converting a reservation, update PostgreSQL reservations table status in SAME transaction
+      // 8. If converting a reservation, update PostgreSQL reservations table status in SAME transaction
       if (cmd.reservationId) {
         await client.query(
-          `UPDATE reservations SET status = 'ConvertedToSale', updated_at = NOW() WHERE id = $1 AND status = 'Confirmed'`,
+          `UPDATE reservations SET status = 'ConvertedToSale', version = version + 1, updated_at = NOW() WHERE id = $1 AND status = 'Confirmed'`,
           [cmd.reservationId]
         );
       }
 
-      // 7. INSERT Sale lines into PostgreSQL in SAME transaction
+      // 9. INSERT Sale lines into PostgreSQL in SAME transaction
       for (const line of sale.lines) {
         const lineQuery = `
           INSERT INTO sale_lines (id, sale_id, venue_asset_id, quantity, unit_price, total_price)
@@ -311,7 +320,7 @@ export class ProcessExternalSaleConfirmationUseCase {
         await client.query(lineQuery, [line.id, sale.id, line.venueAssetId, line.unitPrice]);
       }
 
-      // 8. INSERT OutboxMessage into PostgreSQL in SAME transaction
+      // 10. INSERT OutboxMessage into PostgreSQL in SAME transaction
       const event: SaleRecordedDomainEvent = {
         eventName: DomainEventNames.SaleRecorded,
         header: {
