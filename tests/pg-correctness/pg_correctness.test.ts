@@ -7,6 +7,7 @@ import { PgConsumerIdempotencyStore } from '@/platform/pg/PgConsumerIdempotencyS
 import { AccountingSaleRecordedHandler } from '@/accounting/application/handlers/AccountingSaleRecordedHandler';
 import { OperationsSaleRecordedHandler } from '@/operations/application/handlers/OperationsSaleRecordedHandler';
 import { ProcessExternalSaleConfirmationUseCase } from '@/services/ProcessExternalSaleConfirmationUseCase';
+import { ReservationService } from '@/services/ReservationService';
 import { DomainEventNames, SaleRecordedDomainEvent } from '@/domain/events/DomainEvents';
 import { DomainEvent } from '@/application/EventBus';
 import { IdGenerator } from '@/platform/IdGenerator';
@@ -17,7 +18,7 @@ import { MockDataStore } from '@/repositories/mock/MockRepositories';
 import fs from 'fs';
 import path from 'path';
 
-describe('PostgreSQL Correctness Baseline (T1 - T52 Integration Tests)', () => {
+describe('PostgreSQL Correctness Baseline (T1 - T57 Integration Tests)', () => {
   let pool: Pool;
 
   beforeAll(async () => {
@@ -34,7 +35,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T52 Integration Tests)', () => {
   });
 
   beforeEach(async () => {
-    await pool.query('TRUNCATE outbox_messages, processed_events, sales, sale_lines, accounting_entries, venue_asset_projections, admission_rights CASCADE;');
+    await pool.query('TRUNCATE outbox_messages, processed_events, sales, sale_lines, reservations, accounting_entries, venue_asset_projections, admission_rights CASCADE;');
     
     // Seed default venue asset projections in PostgreSQL for DB-authoritative execution mode
     await pool.query(`
@@ -1644,5 +1645,237 @@ describe('PostgreSQL Correctness Baseline (T1 - T52 Integration Tests)', () => {
     // Ledger balance sum equals net revenue recognized by organizer (23,500 TRY)
     const ledgerBalanceSum = parseFloat(revenueEntry.amount) + parseFloat(commissionEntry.amount);
     expect(ledgerBalanceSum).toBe(23500);
+  });
+
+  it('T53: Reservation Hold Protection & State Machine Invariant Test', async () => {
+    // 1. Create a reservation hold for asset_vip_a2 in PostgreSQL mode
+    const reservation = await UnitOfWork.execute((tx) =>
+      ReservationService.createReservationPg(tx, {
+        eventId: 'event_gala_2026',
+        assetId: 'asset_vip_a2',
+        customerName: 'Ayşe Yılmaz',
+        customerPhone: '5551112233',
+        customerEmail: 'ayse@example.com',
+        guestCountPax: 4,
+        expirationHours: 24,
+      })
+    );
+
+    // Verify DB projection status is 'Reserved' and reservation_id is linked
+    const projRes = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', ['asset_vip_a2']);
+    expect(projRes.rows[0].status).toBe('Reserved');
+    expect(projRes.rows[0].reservation_id).toBe(reservation.id);
+
+    // 2. Attempt sale WITHOUT reservationId against reserved asset -> Throws SEAT_ALREADY_RESERVED
+    await expect(
+      UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({
+          eventId: 'event_gala_2026',
+          assetId: 'asset_vip_a2',
+          salesChannelId: 'biletix',
+          externalSaleReference: 'UNAUTHORIZED-SALE-TRY-1',
+          pgClient: tx,
+        })
+      )
+    ).rejects.toThrow('SEAT_ALREADY_RESERVED: Asset is currently reserved by another reservation hold.');
+
+    // 3. Attempt sale WITH DIFFERENT reservationId -> Throws SEAT_ALREADY_RESERVED
+    await expect(
+      UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({
+          eventId: 'event_gala_2026',
+          assetId: 'asset_vip_a2',
+          reservationId: IdGenerator.generateUUIDv7(),
+          salesChannelId: 'biletix',
+          externalSaleReference: 'WRONG-RES-SALE-TRY-2',
+          pgClient: tx,
+        })
+      )
+    ).rejects.toThrow('SEAT_ALREADY_RESERVED: Asset is currently reserved by another reservation hold.');
+
+    // 4. Execute sale WITH MATCHING reservationId -> Conversion succeeds!
+    const saleResult = await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({
+        eventId: 'event_gala_2026',
+        assetId: 'asset_vip_a2',
+        reservationId: reservation.id,
+        salesChannelId: 'biletix',
+        externalSaleReference: 'AUTHORIZED-CONVERT-SALE-001',
+        purchaserEmail: 'ayse@example.com',
+        pgClient: tx,
+      })
+    );
+
+    expect(saleResult.isDuplicateRecord).toBe(false);
+
+    // Verify DB state transitions: asset -> Sold, reservation -> ConvertedToSale
+    const updatedProj = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', ['asset_vip_a2']);
+    const updatedRes = await pool.query('SELECT * FROM reservations WHERE id = $1', [reservation.id]);
+
+    expect(updatedProj.rows[0].status).toBe('Sold');
+    expect(updatedRes.rows[0].status).toBe('ConvertedToSale');
+  });
+
+  it('T54: Reservation -> Sale Atomicity & Rollback Safety Test', async () => {
+    // 1. Create a reservation for asset_vip_a3
+    const reservation = await UnitOfWork.execute((tx) =>
+      ReservationService.createReservationPg(tx, {
+        eventId: 'event_gala_2026',
+        assetId: 'asset_vip_a3',
+        customerName: 'Mehmet Demir',
+        customerPhone: '5552223344',
+        customerEmail: 'mehmet@example.com',
+        guestCountPax: 6,
+      })
+    );
+
+    // 2. Execute conversion in a transaction that encounters a failure AFTER lock acquisition
+    await expect(
+      UnitOfWork.execute(async (tx) => {
+        await ProcessExternalSaleConfirmationUseCase.execute({
+          eventId: 'event_gala_2026',
+          assetId: 'asset_vip_a3',
+          reservationId: reservation.id,
+          salesChannelId: 'biletix',
+          externalSaleReference: 'SIMULATED-FAIL-CONVERT',
+          purchaserEmail: 'mehmet@example.com',
+          pgClient: tx,
+        });
+        throw new Error('SIMULATED_PAYMENT_GATEWAY_CRASH');
+      })
+    ).rejects.toThrow('SIMULATED_PAYMENT_GATEWAY_CRASH');
+
+    // 3. Assert complete transactional rollback: Reservation remains 'Confirmed', asset remains 'Reserved' (NOT reverted to Available or corrupted!)
+    const projRes = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', ['asset_vip_a3']);
+    const resDb = await pool.query('SELECT * FROM reservations WHERE id = $1', [reservation.id]);
+    const saleDb = await pool.query('SELECT * FROM sales WHERE external_reference = $1', ['SIMULATED-FAIL-CONVERT']);
+
+    expect(projRes.rows[0].status).toBe('Reserved');
+    expect(projRes.rows[0].reservation_id).toBe(reservation.id);
+    expect(resDb.rows[0].status).toBe('Confirmed');
+    expect(saleDb.rows.length).toBe(0);
+  });
+
+  it('T55: Reservation Ownership Guard Test', async () => {
+    // 1. Create a reservation for asset_vip_a4 under owner email 'owner@example.com'
+    const reservation = await UnitOfWork.execute((tx) =>
+      ReservationService.createReservationPg(tx, {
+        eventId: 'event_gala_2026',
+        assetId: 'asset_vip_a4',
+        customerName: 'Owner User',
+        customerPhone: '5553334455',
+        customerEmail: 'owner@example.com',
+        guestCountPax: 2,
+      })
+    );
+
+    // 2. Imposter attempts conversion using matching reservationId but DIFFERENT email 'imposter@attacker.com'
+    await expect(
+      UnitOfWork.execute((tx) =>
+        ProcessExternalSaleConfirmationUseCase.execute({
+          eventId: 'event_gala_2026',
+          assetId: 'asset_vip_a4',
+          reservationId: reservation.id,
+          salesChannelId: 'biletix',
+          externalSaleReference: 'ATTACK-CONVERT-001',
+          purchaserEmail: 'imposter@attacker.com',
+          pgClient: tx,
+        })
+      )
+    ).rejects.toThrow('RESERVATION_NOT_OWNED: Purchaser email does not match reservation owner.');
+
+    // 3. Assert ZERO side-effects in PostgreSQL
+    const resDb = await pool.query('SELECT * FROM reservations WHERE id = $1', [reservation.id]);
+    const projRes = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', ['asset_vip_a4']);
+
+    expect(resDb.rows[0].status).toBe('Confirmed');
+    expect(projRes.rows[0].status).toBe('Reserved');
+  });
+
+  it('T56: Expired Reservation Race Test — Expiration worker vs Conversion race', async () => {
+    // 1. Seed an already expired reservation in PostgreSQL (expiration_date = NOW() - 1 hour)
+    const resId = IdGenerator.generateUUIDv7();
+    const nowISO = new Date().toISOString();
+    const pastExpISO = new Date(Date.now() - 3600000).toISOString();
+
+    await pool.query(
+      `INSERT INTO reservations (id, organization_id, event_id, asset_id, customer_id, customer_name, customer_phone, customer_email, guest_count_pax, status, expiration_date, created_at, updated_at)
+       VALUES ($1, 'org_01', 'event_gala_2026', 'asset_bistro_b1', $2, 'Expired Holder', '555', 'expired@test.com', 4, 'Confirmed', $3, $4, $4);`,
+      [resId, IdGenerator.generateUUIDv7(), pastExpISO, nowISO]
+    );
+
+    await pool.query(
+      `UPDATE venue_asset_projections SET status = 'Reserved', occupancy_state = 'Reserved', reservation_id = $1 WHERE asset_id = 'asset_bistro_b1'`,
+      [resId]
+    );
+
+    // 2. Run expiration worker and conversion attempt concurrently
+    const expireTask = UnitOfWork.execute((tx) => ReservationService.expireReservationsPg(tx));
+    const convertTask = UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({
+        eventId: 'event_gala_2026',
+        assetId: 'asset_bistro_b1',
+        reservationId: resId,
+        salesChannelId: 'biletix',
+        externalSaleReference: 'EXPIRED-CONVERT-ATTEMPT',
+        pgClient: tx,
+      })
+    ).catch((err: Error) => ({ error: err.message }));
+
+    const [expiredCount, convertRes] = await Promise.all([expireTask, convertTask]);
+
+    // 3. Assert deterministic state transition: Expiration worker transitioned asset to Available & reservation to Expired
+    expect(expiredCount).toBe(1);
+    expect(convertRes).toHaveProperty('error');
+    expect((convertRes as any).error).toContain('RESERVATION_EXPIRED');
+
+    const projRes = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', ['asset_bistro_b1']);
+    const resDb = await pool.query('SELECT * FROM reservations WHERE id = $1', [resId]);
+
+    expect(projRes.rows[0].status).toBe('Available');
+    expect(resDb.rows[0].status).toBe('Expired');
+  });
+
+  it('T57: Duplicate Conversion Idempotency Test', async () => {
+    // 1. Create a reservation for asset_bistro_b2
+    const reservation = await UnitOfWork.execute((tx) =>
+      ReservationService.createReservationPg(tx, {
+        eventId: 'event_gala_2026',
+        assetId: 'asset_bistro_b2',
+        customerName: 'Selin Arslan',
+        customerPhone: '5554445566',
+        customerEmail: 'selin@example.com',
+        guestCountPax: 4,
+      })
+    );
+
+    const command = {
+      eventId: 'event_gala_2026',
+      assetId: 'asset_bistro_b2',
+      reservationId: reservation.id,
+      salesChannelId: 'biletix',
+      externalSaleReference: 'BTX-CONVERT-DUP-001',
+      purchaserEmail: 'selin@example.com',
+    };
+
+    // 2. First conversion call -> Succeeds
+    const res1 = await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+    );
+    expect(res1.isDuplicateRecord).toBe(false);
+
+    // 3. Duplicate conversion call with SAME (salesChannelId, externalSaleReference) -> Returns existing sale payload
+    const res2 = await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+    );
+    expect(res2.isDuplicateRecord).toBe(true);
+    expect(res2.sale.id).toBe(res1.sale.id);
+
+    // 4. Assert exactly 1 sale row exists in PostgreSQL sales table and reservation status remains 'ConvertedToSale'
+    const salesDb = await pool.query('SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2', [command.salesChannelId, command.externalSaleReference]);
+    const resDb = await pool.query('SELECT * FROM reservations WHERE id = $1', [reservation.id]);
+
+    expect(salesDb.rows.length).toBe(1);
+    expect(resDb.rows[0].status).toBe('ConvertedToSale');
   });
 });

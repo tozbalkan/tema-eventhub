@@ -86,6 +86,28 @@ CREATE TABLE IF NOT EXISTS sale_lines (
 
 CREATE INDEX IF NOT EXISTS idx_sale_lines_sale_id ON sale_lines (sale_id);
 
+-- Reservations Table (Aggregate Persistence & Reservation Holds)
+CREATE TABLE IF NOT EXISTS reservations (
+  id                  UUID PRIMARY KEY,
+  organization_id     VARCHAR(100) NOT NULL,
+  event_id            VARCHAR(100) NOT NULL,
+  asset_id            VARCHAR(100) NOT NULL,
+  customer_id         VARCHAR(100),
+  customer_name       VARCHAR(200) NOT NULL,
+  customer_phone      VARCHAR(50),
+  customer_email      VARCHAR(200),
+  guest_count_pax     INT NOT NULL DEFAULT 1,
+  status              VARCHAR(30) NOT NULL DEFAULT 'Confirmed',
+  cancellation_reason VARCHAR(50),
+  expiration_date     TIMESTAMPTZ NOT NULL,
+  version             INT NOT NULL DEFAULT 1,
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_reservations_asset ON reservations (asset_id, status);
+CREATE INDEX IF NOT EXISTS idx_reservations_expiration ON reservations (expiration_date, status) WHERE status = 'Confirmed';
+
 -- Accounting Entries (Business Mutation)
 CREATE TABLE IF NOT EXISTS accounting_entries (
   id                UUID PRIMARY KEY,

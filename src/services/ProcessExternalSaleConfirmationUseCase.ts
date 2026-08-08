@@ -41,9 +41,10 @@ export interface ProcessExternalSaleConfirmationResult {
 /**
  * StageOps Application Use Case: Process External Sale Confirmation.
  * 
- * PostgreSQL Transaction Flow (Multi-Asset Deterministic Deadlock-Free Pattern):
+ * PostgreSQL Transaction Flow (Multi-Asset Deterministic Deadlock-Free Pattern + Reservation Hold Protection):
  * 1. Command Idempotency Check (SELECT existing sale for channel + reference)
  * 2. Database-Authoritative Asset & Channel Validation (Query venue_asset_projections & sales_channels directly in PostgreSQL)
+ *    - Check Reservation Hold Ownership & Expiration (Reject unauthorized or expired reservation conversion attempts)
  * 3. Command-Supplied Tenant Identity (organizationId passed via command payload, persisted transactionally)
  * 4. Heterogeneous Asset Pricing & VAT-Exclusive Tax Calculation (Sum of base_price across all requested asset projections; 20% KDV on net base_price)
  * 5. Non-Aborting Sale Ownership Reservation FIRST (INSERT INTO sales ON CONFLICT DO NOTHING RETURNING id)
@@ -51,8 +52,8 @@ export interface ProcessExternalSaleConfirmationResult {
  *    - If conflict occurs but row is uncommitted/unavailable: Throw SALE_OWNERSHIP_CONFLICT to prevent un-owned sale fallthrough
  * 6. Deterministic Asset Lock Ordering (sortedAssetIds = Array.from(new Set(assetIds)).sort()) & Acquisition ONLY IF sale ownership was won!
  *    - Input array deduplicated to prevent duplicate line self-lock conflicts.
- *    - If any asset is already sold: Throw SEAT_ALREADY_RESERVED (triggers UnitOfWork ROLLBACK of step 5 sale insert)
- * 7. Persist Sale Lines & OutboxMessage in SAME PostgreSQL Transaction
+ *    - If any asset is already sold (or reserved by another hold): Throw SEAT_ALREADY_RESERVED (triggers UnitOfWork ROLLBACK of step 5 sale insert)
+ * 7. Update Reservation Status to 'ConvertedToSale', Persist Sale Lines & OutboxMessage in SAME PostgreSQL Transaction
  * 8. UnitOfWork commits cleanly without 23505 transaction abortion or deadlock hazards
  */
 export class ProcessExternalSaleConfirmationUseCase {
@@ -80,7 +81,7 @@ export class ProcessExternalSaleConfirmationUseCase {
       }
 
       // 2. Database-Authoritative Asset Validation: Query venue_asset_projections directly in PostgreSQL
-      const assetProjections: Array<{ asset_id: string; name: string; category: string; status: string; base_price: number; currency: CurrencyCode }> = [];
+      const assetProjections: Array<{ asset_id: string; name: string; category: string; status: string; base_price: number; currency: CurrencyCode; reservation_id?: string }> = [];
 
       for (const currentAssetId of uniqueAssetIds) {
         const dbAssetRes = await client.query(
@@ -100,6 +101,7 @@ export class ProcessExternalSaleConfirmationUseCase {
           status: row.status,
           base_price: parseFloat(row.base_price || '0'),
           currency: 'TRY' as CurrencyCode,
+          reservation_id: row.reservation_id || undefined,
         };
 
         if (assetObj.status === 'Sold') {
@@ -111,6 +113,30 @@ export class ProcessExternalSaleConfirmationUseCase {
             return this.reconstructDuplicateSaleResponse(client, doubleCheckCommitted.rows[0], cmd);
           }
           throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
+        }
+
+        // Reservation Hold Guard: If asset is currently Reserved in PostgreSQL
+        if (assetObj.status === 'Reserved') {
+          const activeResId = assetObj.reservation_id;
+          if (activeResId) {
+            if (!cmd.reservationId || cmd.reservationId !== activeResId) {
+              throw new Error('SEAT_ALREADY_RESERVED: Asset is currently reserved by another reservation hold.');
+            }
+
+            const resDb = await client.query('SELECT * FROM reservations WHERE id = $1', [activeResId]);
+            if (resDb.rows.length > 0) {
+              const resData = resDb.rows[0];
+              if (resData.status === 'Expired' || new Date(resData.expiration_date).getTime() < Date.now()) {
+                throw new Error('RESERVATION_EXPIRED: Reservation hold has expired.');
+              }
+              if (resData.status === 'Cancelled') {
+                throw new Error('RESERVATION_CANCELLED: Reservation hold has been cancelled.');
+              }
+              if (cmd.purchaserEmail && resData.customer_email && cmd.purchaserEmail.toLowerCase() !== resData.customer_email.toLowerCase()) {
+                throw new Error('RESERVATION_NOT_OWNED: Purchaser email does not match reservation owner.');
+              }
+            }
+          }
         }
 
         assetProjections.push(assetObj);
@@ -252,7 +278,8 @@ export class ProcessExternalSaleConfirmationUseCase {
             sale_id = EXCLUDED.sale_id,
             version = venue_asset_projections.version + 1,
             last_updated = NOW()
-          WHERE venue_asset_projections.status <> 'Sold';
+          WHERE venue_asset_projections.status <> 'Sold'
+            AND (venue_asset_projections.reservation_id IS NULL OR venue_asset_projections.reservation_id = $5 OR $5 IS NOT NULL);
         `;
         const lockRes = await client.query(lockAssetQuery, [
           assetIdToLock,
@@ -263,8 +290,16 @@ export class ProcessExternalSaleConfirmationUseCase {
           assetProj?.base_price || 0,
         ]);
         if (lockRes.rowCount === 0) {
-          throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
+          throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold or reserved by another reservation.');
         }
+      }
+
+      // If converting a reservation, update PostgreSQL reservations table status in SAME transaction
+      if (cmd.reservationId) {
+        await client.query(
+          `UPDATE reservations SET status = 'ConvertedToSale', updated_at = NOW() WHERE id = $1 AND status = 'Confirmed'`,
+          [cmd.reservationId]
+        );
       }
 
       // 7. INSERT Sale lines into PostgreSQL in SAME transaction
@@ -330,6 +365,12 @@ export class ProcessExternalSaleConfirmationUseCase {
         if (a.status === 'Sold') {
           IdempotencyStore.markFailed(idempotencyKey);
           throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
+        }
+        if (a.status === 'Reserved') {
+          if (!cmd.reservationId) {
+            IdempotencyStore.markFailed(idempotencyKey);
+            throw new Error('SEAT_ALREADY_RESERVED: Asset is currently reserved by another reservation hold.');
+          }
         }
         return a;
       });
