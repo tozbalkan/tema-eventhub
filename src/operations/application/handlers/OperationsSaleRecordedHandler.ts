@@ -6,6 +6,7 @@ import { VenueService } from '@/services/VenueService';
 import { MockDataStore } from '@/repositories/mock/MockRepositories';
 import { ConsumerIdempotencyStore } from '@/platform/ConsumerIdempotencyStore';
 import { PgConsumerIdempotencyStore } from '@/platform/pg/PgConsumerIdempotencyStore';
+import { AdmissionService } from '@/services/AdmissionService';
 
 const CONSUMER_NAME = 'OperationsSaleRecordedHandler';
 
@@ -38,11 +39,15 @@ export class OperationsSaleRecordedHandler {
 
             const unitPrice = parseFloat(line.unit_price || sale.gross_price);
 
+            // Read asset projection to obtain pax_capacity
+            const assetProjRes = await tx.query('SELECT pax_capacity FROM venue_asset_projections WHERE asset_id = $1', [assetId]);
+            const paxCapacity = assetProjRes.rows.length > 0 && assetProjRes.rows[0].pax_capacity > 0 ? assetProjRes.rows[0].pax_capacity : 6;
+
             // 1. Update venue_asset_projections table
             const assetQuery = `
               INSERT INTO venue_asset_projections (
                 asset_id, name, category, status, display_color, occupancy_state, sale_id, reservation_id, pax_capacity, base_price, version, last_updated
-              ) VALUES ($1, 'VIP Masa', 'VIP', 'Sold', 'hsl(350 80% 55%)', 'Occupied', $2, $3, 6, $4, 2, NOW())
+              ) VALUES ($1, 'VIP Masa', 'VIP', 'Sold', 'hsl(350 80% 55%)', 'Occupied', $2, $3, $4, $5, 2, NOW())
               ON CONFLICT (asset_id) DO UPDATE SET
                 status = 'Sold',
                 occupancy_state = 'Occupied',
@@ -51,20 +56,16 @@ export class OperationsSaleRecordedHandler {
                 version = venue_asset_projections.version + 1,
                 last_updated = NOW();
             `;
-            await tx.query(assetQuery, [assetId, sale.id, sale.reservation_id, unitPrice]);
+            await tx.query(assetQuery, [assetId, sale.id, sale.reservation_id, paxCapacity, unitPrice]);
 
-            // 2. Insert into admission_rights table
-            const admissionQuery = `
-              INSERT INTO admission_rights (
-                asset_id, purchaser_name, is_allowed, sale_id, reservation_id, already_admitted_count, max_capacity_pax
-              ) VALUES ($1, $2, TRUE, $3, $4, 0, 6)
-              ON CONFLICT (asset_id) DO UPDATE SET
-                purchaser_name = EXCLUDED.purchaser_name,
-                is_allowed = TRUE,
-                sale_id = EXCLUDED.sale_id,
-                reservation_id = EXCLUDED.reservation_id;
-            `;
-            await tx.query(admissionQuery, [assetId, sale.purchaser_name || 'VIP Misafir', sale.id, sale.reservation_id]);
+            // 2. Initialize admission_rights table
+            await AdmissionService.initializeAdmissionRightPg(tx, {
+              assetId,
+              saleId: sale.id,
+              reservationId: sale.reservation_id || undefined,
+              purchaserName: sale.purchaser_name || 'VIP Misafir',
+              maxCapacityPax: paxCapacity,
+            });
           }
         }
       );

@@ -8,6 +8,7 @@ import { AccountingSaleRecordedHandler } from '@/accounting/application/handlers
 import { OperationsSaleRecordedHandler } from '@/operations/application/handlers/OperationsSaleRecordedHandler';
 import { ProcessExternalSaleConfirmationUseCase } from '@/services/ProcessExternalSaleConfirmationUseCase';
 import { ReservationService } from '@/services/ReservationService';
+import { AdmissionService } from '@/services/AdmissionService';
 import { DomainEventNames, SaleRecordedDomainEvent } from '@/domain/events/DomainEvents';
 import { DomainEvent } from '@/application/EventBus';
 import { IdGenerator } from '@/platform/IdGenerator';
@@ -18,7 +19,7 @@ import { MockDataStore } from '@/repositories/mock/MockRepositories';
 import fs from 'fs';
 import path from 'path';
 
-describe('PostgreSQL Correctness Baseline (T1 - T62 Integration Tests)', () => {
+describe('PostgreSQL Correctness Baseline (T1 - T69 Integration Tests)', () => {
   let pool: Pool;
 
   beforeAll(async () => {
@@ -35,7 +36,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T62 Integration Tests)', () => {
   });
 
   beforeEach(async () => {
-    await pool.query('TRUNCATE outbox_messages, processed_events, sales, sale_lines, reservations, accounting_entries, venue_asset_projections, admission_rights CASCADE;');
+    await pool.query('TRUNCATE outbox_messages, processed_events, sales, sale_lines, reservations, accounting_entries, venue_asset_projections, admission_rights, admission_scans CASCADE;');
     
     // Seed default venue asset projections in PostgreSQL for DB-authoritative execution mode
     await pool.query(`
@@ -946,7 +947,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T62 Integration Tests)', () => {
   });
 
   it('T32: System Catalog Index Definition & Unique Constraint Sanity Check', async () => {
-    const requiredTables = ['sales', 'sale_lines', 'outbox_messages', 'venue_asset_projections', 'accounting_entries', 'processed_events'];
+    const requiredTables = ['sales', 'sale_lines', 'outbox_messages', 'venue_asset_projections', 'accounting_entries', 'processed_events', 'admission_rights', 'admission_scans'];
     const tablesRes = await pool.query(
       `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name = ANY($1)`,
       [requiredTables]
@@ -2241,5 +2242,245 @@ describe('PostgreSQL Correctness Baseline (T1 - T62 Integration Tests)', () => {
     await expect(
       UnitOfWork.execute((tx) => ReservationService.cancelReservationPg(tx, resAvailable.id, 'CUSTOMER'))
     ).rejects.toThrow('RESERVATION_ALREADY_CONVERTED');
+  });
+
+  it('T63: Admission Rights Atomic Initialization Test', async () => {
+    // 1. Process sale for asset_vip_a1
+    const saleResult = await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({
+        eventId: 'event_gala_2026',
+        assetId: 'asset_vip_a1',
+        salesChannelId: 'biletix',
+        externalSaleReference: 'BTX-INIT-ADMISSION-001',
+        purchaserName: 'Bora Aksoy',
+        pgClient: tx,
+      })
+    );
+
+    // 2. Dispatch SaleRecordedDomainEvent to OperationsSaleRecordedHandler
+    await UnitOfWork.execute((tx) => OperationsSaleRecordedHandler.handle(saleResult.event!, tx));
+
+    // 3. Query PostgreSQL admission_rights table
+    const arRes = await pool.query('SELECT * FROM admission_rights WHERE asset_id = $1', ['asset_vip_a1']);
+    expect(arRes.rows.length).toBe(1);
+
+    const row = arRes.rows[0];
+    expect(row.is_allowed).toBe(true);
+    expect(row.sale_id).toBe(saleResult.sale.id);
+    expect(row.already_admitted_count).toBe(0);
+    expect(row.max_capacity_pax).toBe(6);
+    expect(row.purchaser_name).toBe('Bora Aksoy');
+  });
+
+  it('T64: Idempotent Admission Projection Consumption Test (100 Duplicate Events)', async () => {
+    const saleResult = await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({
+        eventId: 'event_gala_2026',
+        assetId: 'asset_vip_a2',
+        salesChannelId: 'biletix',
+        externalSaleReference: 'BTX-IDEM-ADMISSION-001',
+        purchaserName: 'Idempotency User',
+        pgClient: tx,
+      })
+    );
+
+    // Consume the EXACT SAME SaleRecordedDomainEvent 100 times concurrently
+    const tasks = Array.from({ length: 100 }, () =>
+      UnitOfWork.execute((tx) => OperationsSaleRecordedHandler.handle(saleResult.event!, tx))
+    );
+
+    await Promise.all(tasks);
+
+    // Assert EXACTLY 1 row in admission_rights table and 1 row in processed_events table
+    const arRes = await pool.query('SELECT * FROM admission_rights WHERE asset_id = $1', ['asset_vip_a2']);
+    const peRes = await pool.query('SELECT * FROM processed_events WHERE event_id = $1 AND consumer_name = $2', [
+      saleResult.event!.header.eventId,
+      'OperationsSaleRecordedHandler',
+    ]);
+
+    expect(arRes.rows.length).toBe(1);
+    expect(arRes.rows[0].already_admitted_count).toBe(0);
+    expect(peRes.rows.length).toBe(1);
+  });
+
+  it('T65: Gate Scan Atomic Increment Stress Test (100 Concurrent Parallel Scans)', async () => {
+    const assetId = 'asset_bistro_b1'; // pax_capacity = 4
+    const saleId = IdGenerator.generateUUIDv7();
+
+    // Seed admission_rights with max_capacity_pax = 10 and already_admitted_count = 0
+    await UnitOfWork.execute((tx) =>
+      AdmissionService.initializeAdmissionRightPg(tx, {
+        assetId,
+        saleId,
+        purchaserName: 'Capacity Test Group',
+        maxCapacityPax: 10,
+      })
+    );
+
+    // Launch 100 concurrent gate scan requests
+    const tasks = Array.from({ length: 100 }, () =>
+      UnitOfWork.execute((tx) => AdmissionService.processGateScanPg(tx, { assetId }))
+        .catch((err: Error) => ({ error: err.message }))
+    );
+
+    const results = await Promise.all(tasks);
+    const successfulScans = results.filter((r) => 'alreadyAdmittedCount' in r && !r.isDuplicateScan);
+    const rejectedScans = results.filter((r) => 'error' in r && r.error.includes('CAPACITY_EXCEEDED'));
+
+    // Assert EXACTLY 10 successful scans and 90 rejected scans!
+    expect(successfulScans.length).toBe(10);
+    expect(rejectedScans.length).toBe(90);
+
+    // Assert PostgreSQL DB already_admitted_count is EXACTLY 10 (NEVER > max_capacity_pax!)
+    const arRes = await pool.query('SELECT * FROM admission_rights WHERE asset_id = $1', [assetId]);
+    expect(arRes.rows[0].already_admitted_count).toBe(10);
+  });
+
+  it('T66: Capacity Boundary & DB CHECK Constraint Test', async () => {
+    const assetId = 'asset_bistro_b2';
+    const saleId = IdGenerator.generateUUIDv7();
+
+    await UnitOfWork.execute((tx) =>
+      AdmissionService.initializeAdmissionRightPg(tx, {
+        assetId,
+        saleId,
+        maxCapacityPax: 10,
+      })
+    );
+
+    // 1. Boundary State 1: Count = 0, Max = 10 -> Allowed
+    const scan1 = await UnitOfWork.execute((tx) => AdmissionService.processGateScanPg(tx, { assetId }));
+    expect(scan1.alreadyAdmittedCount).toBe(1);
+
+    // Manually set already_admitted_count = 9
+    await pool.query(`UPDATE admission_rights SET already_admitted_count = 9 WHERE asset_id = $1`, [assetId]);
+
+    // 2. Boundary State 2: Count = 9, Max = 10 -> Allowed
+    const scan2 = await UnitOfWork.execute((tx) => AdmissionService.processGateScanPg(tx, { assetId }));
+    expect(scan2.alreadyAdmittedCount).toBe(10);
+
+    // 3. Boundary State 3: Count = 10, Max = 10 -> Rejected with CAPACITY_EXCEEDED
+    await expect(
+      UnitOfWork.execute((tx) => AdmissionService.processGateScanPg(tx, { assetId }))
+    ).rejects.toThrow('CAPACITY_EXCEEDED');
+
+    // 4. Boundary State 4: Direct SQL attempt to set count = 11 -> Blocked by PostgreSQL chk_capacity_boundary CHECK constraint!
+    await expect(
+      pool.query(`UPDATE admission_rights SET already_admitted_count = 11 WHERE asset_id = $1`, [assetId])
+    ).rejects.toThrow();
+  });
+
+  it('T67: is_allowed Guard Race Test (100 Concurrent Workers vs Disable)', async () => {
+    const assetId = 'asset_bistro_b3';
+    const saleId = IdGenerator.generateUUIDv7();
+
+    await UnitOfWork.execute((tx) =>
+      AdmissionService.initializeAdmissionRightPg(tx, {
+        assetId,
+        saleId,
+        maxCapacityPax: 50,
+      })
+    );
+
+    // 50 Gate Scans vs 1 Disable Command
+    const scanTasks = Array.from({ length: 50 }, () =>
+      UnitOfWork.execute((tx) => AdmissionService.processGateScanPg(tx, { assetId }))
+        .catch((err: Error) => ({ error: err.message }))
+    );
+
+    const toggleTask = UnitOfWork.execute((tx) => AdmissionService.toggleAdmissionRightPg(tx, assetId, false));
+
+    await Promise.all([...scanTasks, toggleTask]);
+
+    // Verify after disable, ANY subsequent scan is rejected with ADMISSION_DENIED
+    await expect(
+      UnitOfWork.execute((tx) => AdmissionService.processGateScanPg(tx, { assetId }))
+    ).rejects.toThrow('ADMISSION_DENIED');
+  });
+
+  it('T68: Duplicate Gate Scan Reference Idempotency Test', async () => {
+    const assetId = 'asset_vip_a3';
+    const saleId = IdGenerator.generateUUIDv7();
+
+    await UnitOfWork.execute((tx) =>
+      AdmissionService.initializeAdmissionRightPg(tx, {
+        assetId,
+        saleId,
+        maxCapacityPax: 6,
+      })
+    );
+
+    // 1. Initial Scan with reference 'REF-SCAN-101' -> Allowed
+    const scan1 = await UnitOfWork.execute((tx) =>
+      AdmissionService.processGateScanPg(tx, { assetId, scanReference: 'REF-SCAN-101' })
+    );
+    expect(scan1.isDuplicateScan).toBe(false);
+    expect(scan1.alreadyAdmittedCount).toBe(1);
+
+    // 2. Duplicate Scan with SAME reference 'REF-SCAN-101' -> Returns cached state without incrementing count!
+    const scan2 = await UnitOfWork.execute((tx) =>
+      AdmissionService.processGateScanPg(tx, { assetId, scanReference: 'REF-SCAN-101' })
+    );
+    expect(scan2.isDuplicateScan).toBe(true);
+    expect(scan2.alreadyAdmittedCount).toBe(1);
+
+    // 3. New Scan with reference 'REF-SCAN-102' -> Increments count to 2
+    const scan3 = await UnitOfWork.execute((tx) =>
+      AdmissionService.processGateScanPg(tx, { assetId, scanReference: 'REF-SCAN-102' })
+    );
+    expect(scan3.isDuplicateScan).toBe(false);
+    expect(scan3.alreadyAdmittedCount).toBe(2);
+
+    // Assert admission_scans table contains 2 distinct rows
+    const scansDb = await pool.query('SELECT * FROM admission_scans WHERE asset_id = $1', [assetId]);
+    expect(scansDb.rows.length).toBe(2);
+  });
+
+  it('T69: Full Admission & Scan Concurrency Harness Test', async () => {
+    const assetId = 'asset_bistro_b4';
+
+    // 1. Complete Sale Execution
+    const saleResult = await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({
+        eventId: 'event_gala_2026',
+        assetId,
+        salesChannelId: 'biletix',
+        externalSaleReference: 'BTX-FULL-ADMISSION-HARNESS-001',
+        purchaserName: 'Harness Group',
+        pgClient: tx,
+      })
+    );
+
+    // 2. Process Domain Event (initialize admission_rights)
+    await UnitOfWork.execute((tx) => OperationsSaleRecordedHandler.handle(saleResult.event!, tx));
+
+    // 3. Launch mixed parallel stress tasks: 20 Scans, 10 Duplicate Scans, 5 Duplicate Event Handlers
+    const scanTasks = Array.from({ length: 20 }, (_, idx) =>
+      UnitOfWork.execute((tx) =>
+        AdmissionService.processGateScanPg(tx, { assetId, scanReference: `SCAN-HARNESS-${idx}` })
+      ).catch((err: Error) => ({ error: err.message }))
+    );
+
+    const dupScanTasks = Array.from({ length: 10 }, () =>
+      UnitOfWork.execute((tx) =>
+        AdmissionService.processGateScanPg(tx, { assetId, scanReference: 'SCAN-HARNESS-0' })
+      ).catch((err: Error) => ({ error: err.message }))
+    );
+
+    const dupEventTasks = Array.from({ length: 5 }, () =>
+      UnitOfWork.execute((tx) => OperationsSaleRecordedHandler.handle(saleResult.event!, tx))
+    );
+
+    await Promise.all([...scanTasks, ...dupScanTasks, ...dupEventTasks]);
+
+    // 4. Query final state in PostgreSQL
+    const arRes = await pool.query('SELECT * FROM admission_rights WHERE asset_id = $1', [assetId]);
+    const row = arRes.rows[0];
+
+    // Assert ZERO count overspill: already_admitted_count MUST be <= max_capacity_pax (4 for bistro_b4)
+    expect(row.already_admitted_count).toBeLessThanOrEqual(4);
+    expect(row.already_admitted_count).toBeGreaterThanOrEqual(0);
+    expect(row.is_allowed).toBe(true);
+    expect(row.sale_id).toBe(saleResult.sale.id);
   });
 });

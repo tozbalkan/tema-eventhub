@@ -143,12 +143,32 @@ CREATE TABLE IF NOT EXISTS venue_asset_projections (
   last_updated     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Admission Rights Table (Gate Scanning Projection & Capacity Invariant Enforcement)
 CREATE TABLE IF NOT EXISTS admission_rights (
-  asset_id              VARCHAR(100) PRIMARY KEY,
-  purchaser_name        VARCHAR(200),
-  is_allowed            BOOLEAN NOT NULL DEFAULT FALSE,
-  sale_id               VARCHAR(100),
-  reservation_id        VARCHAR(100),
-  already_admitted_count INT NOT NULL DEFAULT 0,
-  max_capacity_pax      INT NOT NULL DEFAULT 0
+  asset_id               VARCHAR(100) PRIMARY KEY,
+  purchaser_name         VARCHAR(200),
+  is_allowed             BOOLEAN NOT NULL DEFAULT TRUE,
+  sale_id                VARCHAR(100) NOT NULL,
+  reservation_id         VARCHAR(100),
+  already_admitted_count INT NOT NULL DEFAULT 0 CHECK (already_admitted_count >= 0),
+  max_capacity_pax       INT NOT NULL CHECK (max_capacity_pax > 0),
+  version                INT NOT NULL DEFAULT 1,
+  created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT chk_capacity_boundary CHECK (already_admitted_count <= max_capacity_pax)
+);
+
+ALTER TABLE admission_rights ADD COLUMN IF NOT EXISTS version INT NOT NULL DEFAULT 1;
+ALTER TABLE admission_rights ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE admission_rights ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+ALTER TABLE admission_rights DROP CONSTRAINT IF EXISTS chk_capacity_boundary;
+ALTER TABLE admission_rights ADD CONSTRAINT chk_capacity_boundary CHECK (already_admitted_count <= max_capacity_pax);
+
+-- Admission Scans Table (Duplicate Gate Scan Identity & Idempotency Store)
+CREATE TABLE IF NOT EXISTS admission_scans (
+  id             UUID PRIMARY KEY,
+  asset_id       VARCHAR(100) NOT NULL REFERENCES admission_rights(asset_id) ON DELETE CASCADE,
+  scan_reference VARCHAR(100) NOT NULL UNIQUE,
+  scanned_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
