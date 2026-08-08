@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS sale_lines (
   id                UUID PRIMARY KEY,
   sale_id           UUID NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
   venue_asset_id    VARCHAR(100) NOT NULL,
-  quantity          INT NOT NULL DEFAULT 1,
+  quantity          INT NOT NULL DEFAULT 1 CHECK (quantity = 1),
   unit_price        NUMERIC(15,2) NOT NULL,
   total_price       NUMERIC(15,2) NOT NULL
 );
@@ -143,12 +143,12 @@ CREATE TABLE IF NOT EXISTS venue_asset_projections (
   last_updated     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Admission Rights Table (Gate Scanning Projection & Capacity Invariant Enforcement)
+-- Admission Rights Table (Gate Scanning Projection, FK Referential Integrity & Capacity Invariants)
 CREATE TABLE IF NOT EXISTS admission_rights (
-  asset_id               VARCHAR(100) PRIMARY KEY,
+  asset_id               VARCHAR(100) PRIMARY KEY REFERENCES venue_asset_projections(asset_id) ON DELETE CASCADE,
   purchaser_name         VARCHAR(200),
   is_allowed             BOOLEAN NOT NULL DEFAULT TRUE,
-  sale_id                VARCHAR(100) NOT NULL,
+  sale_id                VARCHAR(100) NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
   reservation_id         VARCHAR(100),
   already_admitted_count INT NOT NULL DEFAULT 0 CHECK (already_admitted_count >= 0),
   max_capacity_pax       INT NOT NULL CHECK (max_capacity_pax > 0),
@@ -165,10 +165,14 @@ ALTER TABLE admission_rights ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT
 ALTER TABLE admission_rights DROP CONSTRAINT IF EXISTS chk_capacity_boundary;
 ALTER TABLE admission_rights ADD CONSTRAINT chk_capacity_boundary CHECK (already_admitted_count <= max_capacity_pax);
 
--- Admission Scans Table (Duplicate Gate Scan Identity & Idempotency Store)
+-- Admission Scans Table (Duplicate Gate Scan Identity per (asset_id, scan_reference) Composite Uniqueness)
 CREATE TABLE IF NOT EXISTS admission_scans (
   id             UUID PRIMARY KEY,
   asset_id       VARCHAR(100) NOT NULL REFERENCES admission_rights(asset_id) ON DELETE CASCADE,
-  scan_reference VARCHAR(100) NOT NULL UNIQUE,
+  scan_reference VARCHAR(100) NOT NULL,
   scanned_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE admission_scans DROP CONSTRAINT IF EXISTS ux_admission_scans_asset_ref;
+ALTER TABLE admission_scans DROP CONSTRAINT IF EXISTS admission_scans_scan_reference_key;
+ALTER TABLE admission_scans ADD CONSTRAINT ux_admission_scans_asset_ref UNIQUE (asset_id, scan_reference);

@@ -1,16 +1,16 @@
-import { PoolClient } from 'pg';
+import type { PoolClient } from 'pg';
 import { SaleRecordedDomainEvent } from '@/domain/events/DomainEvents';
 import { AccountingEntry } from '@/types/accounting-entry';
 import { MockDataStore } from '@/repositories/mock/MockRepositories';
 import { IdGenerator } from '@/platform/IdGenerator';
 import { ConsumerIdempotencyStore } from '@/platform/ConsumerIdempotencyStore';
-import { PgConsumerIdempotencyStore } from '@/platform/pg/PgConsumerIdempotencyStore';
 
 const CONSUMER_NAME = 'AccountingSaleRecordedHandler';
 
 export class AccountingSaleRecordedHandler {
   public static async handle(event: SaleRecordedDomainEvent, client?: PoolClient): Promise<void> {
     if (client) {
+      const { PgConsumerIdempotencyStore } = await import('@/platform/pg/PgConsumerIdempotencyStore');
       // PostgreSQL Transactional Mode: Atomic idempotency check + business mutation in SAME PoolClient transaction
       await PgConsumerIdempotencyStore.processIdempotently(
         client,

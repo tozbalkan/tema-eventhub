@@ -1,35 +1,24 @@
-import { PoolClient } from 'pg';
+import { VenueService } from '@/services/VenueService';
 import { MockDataStore } from '@/repositories/mock/MockRepositories';
 import { Sale, SaleLine } from '@/types/sale';
-import { CurrencyCode } from '@/types/money';
-import { SalesChannel } from '@/types/sales-channel';
-import { VenueService } from './VenueService';
+import { DomainEventNames, SaleRecordedDomainEvent } from '@/domain/events/DomainEvents';
+import { InMemoryEventBus } from '@/application/EventBus';
 import { IdGenerator } from '@/platform/IdGenerator';
-import { SaleRecordedDomainEvent, DomainEventNames } from '@/domain/events/DomainEvents';
-import { IdempotencyStore } from '@/platform/IdempotencyStore';
-import { OutboxStore } from '@/platform/OutboxStore';
-import { PgOutboxStore } from '@/platform/pg/PgOutboxStore';
-import { OutboxPublisherWorker } from '@/platform/OutboxPublisherWorker';
-import { bootstrapStageOpsApplication } from '@/application/Bootstrap';
-import { VenueAssetProjection } from '@/operations/projections/VenueAssetProjection';
+import { ReservationService } from '@/services/ReservationService';
+import type { PoolClient } from 'pg';
 
-export interface ProcessExternalSaleConfirmationCommand {
-  commandId?: string;
-  organizationId?: string; // Tenant identity explicitly supplied by command payload
-  reservationId?: string;
+export interface ProcessExternalSaleConfirmationDTO {
   eventId: string;
   assetId?: string;
-  assetIds?: string[]; // Supports single or multi-asset reservations
-  salesChannelId: string; // e.g. "biletix", "passo", "desk", "corporate"
-  externalSaleReference: string; // e.g. "BTX-20260807-18291"
+  assetIds?: string[];
+  reservationId?: string;
+  salesChannelId: string;
+  externalSaleReference: string;
   purchaserName?: string;
   purchaserPhone?: string;
   purchaserEmail?: string;
-  idempotencyKey?: string;
-  correlationId?: string;
-  traceId?: string;
-  spanId?: string;
-  pgClient?: PoolClient; // Optional PostgreSQL transaction client for UnitOfWork
+  organizationId?: string;
+  pgClient?: PoolClient;
 }
 
 export interface ProcessExternalSaleConfirmationResult {
@@ -38,541 +27,661 @@ export interface ProcessExternalSaleConfirmationResult {
   isDuplicateRecord: boolean;
 }
 
-/**
- * StageOps Application Use Case: Process External Sale Confirmation.
- * 
- * PostgreSQL Transaction Flow (Multi-Asset Deterministic Deadlock-Free Pattern + Reservation Hold Protection):
- * 1. Command Idempotency Check (SELECT existing sale for channel + reference)
- * 2. Reservation Guard: If reservationId is supplied, lock and validate reservation record from PostgreSQL FIRST
- * 3. Database-Authoritative Asset & Channel Validation in CANONICAL SORTED ASSET ORDER (sortedAssetIds = [...uniqueAssetIds].sort())
- *    - Query venue_asset_projections directly in PostgreSQL with FOR UPDATE in sorted order to prevent cross-lock deadlocks
- * 4. Command-Supplied Tenant Identity (organizationId passed via command payload, persisted transactionally)
- * 5. Heterogeneous Asset Pricing & VAT-Exclusive Tax Calculation (Sum of base_price across all requested asset projections; 20% KDV on net base_price)
- * 6. Non-Aborting Sale Ownership Reservation FIRST (INSERT INTO sales ON CONFLICT DO NOTHING RETURNING id)
- *    - If duplicate detected: Return existing sale payload WITHOUT mutating asset projections (Zero Phantom Side-Effects!)
- *    - If conflict occurs but row is uncommitted/unavailable: Throw SALE_OWNERSHIP_CONFLICT to prevent un-owned sale fallthrough
- * 7. Asset Status Transition to 'Sold' in CANONICAL SORTED ASSET ORDER ONLY IF sale ownership was won!
- *    - Input array deduplicated to prevent duplicate line self-lock conflicts.
- *    - If any asset is already sold (or reserved by another hold): Throw SEAT_ALREADY_RESERVED (triggers UnitOfWork ROLLBACK of step 6 sale insert)
- * 8. Update Reservation Status to 'ConvertedToSale', Persist Sale Lines & OutboxMessage in SAME PostgreSQL Transaction
- * 9. UnitOfWork commits cleanly without 23505 transaction abortion or deadlock hazards
- */
 export class ProcessExternalSaleConfirmationUseCase {
-  public static async execute(cmd: ProcessExternalSaleConfirmationCommand): Promise<ProcessExternalSaleConfirmationResult> {
-    bootstrapStageOpsApplication();
+  public static async execute(
+    dto: ProcessExternalSaleConfirmationDTO
+  ): Promise<ProcessExternalSaleConfirmationResult> {
+    const rawAssetIds = dto.assetIds && dto.assetIds.length > 0
+      ? dto.assetIds
+      : dto.assetId
+        ? [dto.assetId]
+        : [];
 
-    const idempotencyKey = cmd.idempotencyKey || cmd.externalSaleReference;
-    const requestedAssetIds = cmd.assetIds && cmd.assetIds.length > 0 ? cmd.assetIds : [cmd.assetId || ''];
-
-    // Deduplicate requested asset IDs for canonical lock ordering and line item processing
-    const uniqueAssetIds = Array.from(new Set(requestedAssetIds));
-    const sortedAssetIds = [...uniqueAssetIds].sort();
-
-    // PostgreSQL Transactional Execution Path (Database-Authoritative Asset & Channel State Mode)
-    if (cmd.pgClient) {
-      const client = cmd.pgClient;
-
-      // 1. Command Idempotency Check (Check if sale already exists for channel + external reference)
-      const existingSaleRes = await client.query(
-        'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
-        [cmd.salesChannelId, cmd.externalSaleReference]
-      );
-
-      if (existingSaleRes.rows.length > 0) {
-        return this.reconstructDuplicateSaleResponse(client, existingSaleRes.rows[0], cmd);
-      }
-
-      // 2. Reservation Guard: If cmd.reservationId is supplied, lock and validate reservation record from PostgreSQL FIRST
-      if (cmd.reservationId) {
-        const resDb = await client.query('SELECT * FROM reservations WHERE id = $1 FOR UPDATE', [cmd.reservationId]);
-        if (resDb.rows.length > 0) {
-          const resData = resDb.rows[0];
-          if (resData.status === 'Expired' || new Date(resData.expiration_date).getTime() < Date.now()) {
-            throw new Error('RESERVATION_EXPIRED: Reservation hold has expired.');
-          }
-          if (resData.status === 'Cancelled') {
-            throw new Error('RESERVATION_CANCELLED: Reservation hold has been cancelled.');
-          }
-          if (cmd.purchaserEmail && resData.customer_email && cmd.purchaserEmail.toLowerCase() !== resData.customer_email.toLowerCase()) {
-            throw new Error('RESERVATION_NOT_OWNED: Purchaser email does not match reservation owner.');
-          }
-        }
-      }
-
-      // 3. Database-Authoritative Asset Validation in CANONICAL SORTED ASSET ORDER (FOR UPDATE locks acquired in sorted order!)
-      const assetProjectionsMap: Map<string, { asset_id: string; name: string; category: string; status: string; base_price: number; currency: CurrencyCode; reservation_id?: string }> = new Map();
-
-      for (const currentAssetId of sortedAssetIds) {
-        const dbAssetRes = await client.query(
-          'SELECT * FROM venue_asset_projections WHERE asset_id = $1 FOR UPDATE',
-          [currentAssetId]
-        );
-
-        if (dbAssetRes.rows.length === 0) {
-          throw new Error(`Asset not found: ${currentAssetId}`);
-        }
-
-        const row = dbAssetRes.rows[0];
-        const assetObj = {
-          asset_id: row.asset_id,
-          name: row.name,
-          category: row.category || 'VIP',
-          status: row.status,
-          base_price: parseFloat(row.base_price || '0'),
-          currency: 'TRY' as CurrencyCode,
-          reservation_id: row.reservation_id || undefined,
-        };
-
-        if (assetObj.status === 'Sold') {
-          const doubleCheckCommitted = await client.query(
-            'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
-            [cmd.salesChannelId, cmd.externalSaleReference]
-          );
-          if (doubleCheckCommitted.rows.length > 0) {
-            return this.reconstructDuplicateSaleResponse(client, doubleCheckCommitted.rows[0], cmd);
-          }
-          throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
-        }
-
-        // Reservation Hold Guard: If asset is currently Reserved in PostgreSQL
-        if (assetObj.status === 'Reserved') {
-          const activeResId = assetObj.reservation_id;
-          if (activeResId) {
-            if (!cmd.reservationId || cmd.reservationId !== activeResId) {
-              throw new Error('SEAT_ALREADY_RESERVED: Asset is currently reserved by another reservation hold.');
-            }
-          }
-        }
-
-        assetProjectionsMap.set(currentAssetId, assetObj);
-      }
-
-      const assetProjections = uniqueAssetIds.map((id) => assetProjectionsMap.get(id)!);
-
-      // 4. Database-Authoritative SalesChannel Metadata Lookup
-      const channelRes = await client.query('SELECT * FROM sales_channels WHERE id = $1', [cmd.salesChannelId]);
-      let channelName = cmd.salesChannelId;
-      let commissionRate = 0.0;
-
-      if (channelRes.rows.length > 0) {
-        channelName = channelRes.rows[0].name;
-        commissionRate = parseFloat(channelRes.rows[0].commission_percentage || '0') / 100;
-      }
-
-      const primaryAsset = assetProjections[0]!;
-      const currency: CurrencyCode = primaryAsset.currency || 'TRY';
-
-      // 5. Pricing & Tax Arithmetic (VAT-Exclusive Baseline: base_price + 20% KDV)
-      const grossPrice = assetProjections.reduce((sum, p) => sum + p.base_price, 0);
-      const totalTaxAmount = assetProjections.reduce((sum, p) => sum + p.base_price * 0.2, 0);
-      const commissionPaid = grossPrice * commissionRate;
-      const netRevenue = grossPrice - commissionPaid;
-
-      // Command-Supplied Tenant Identity (explicitly supplied by command or application default)
-      const organizationId = cmd.organizationId || 'org_stageops_01';
-
-      const nowISO = new Date().toISOString();
-      const commandId = cmd.commandId || IdGenerator.generateUUIDv7();
-      const correlationId = cmd.correlationId || IdGenerator.generateUUIDv7();
-      const saleId = IdGenerator.generateUUIDv7();
-
-      const lines: SaleLine[] = uniqueAssetIds.map((aId) => {
-        const aProj = assetProjectionsMap.get(aId) || primaryAsset;
-        const linePrice = aProj.base_price;
-        const lineCurrency: CurrencyCode = aProj.currency || currency;
-        return {
-          id: IdGenerator.generateUUIDv7(),
-          saleId,
-          itemType: 'VenueAsset' as const,
-          venueAssetId: aId,
-          quantity: 1,
-          unitPrice: linePrice,
-          discountAmount: 0,
-          taxAmount: linePrice * 0.2,
-          totalPrice: linePrice,
-          currency: lineCurrency,
-          exchangeRate: 1.0,
-        };
-      });
-
-      const sale: Sale = {
-        id: saleId,
-        organizationId,
-        eventId: cmd.eventId,
-        reservationId: cmd.reservationId,
-        salesChannelId: cmd.salesChannelId,
-        externalReference: cmd.externalSaleReference,
-        channel: { type: 'ExternalChannel', name: channelName, reference: cmd.externalSaleReference },
-        purchaserSnapshot: {
-          fullName: cmd.purchaserName || 'Unspecified Purchaser',
-          phone: cmd.purchaserPhone || '',
-          email: cmd.purchaserEmail || '',
-        },
-        saleDate: nowISO,
-        grossPrice,
-        commissionRate,
-        commissionPaid,
-        netRevenue,
-        currency,
-        exchangeRate: 1.0,
-        exchangeRateSource: 'TCMB',
-        accountingAmount: grossPrice,
-        lines,
-        revenueSplit: {
-          organizerAmount: { minorUnits: BigInt(Math.round(netRevenue * 100)), currency, scale: 100 },
-          platformCommission: { minorUnits: BigInt(Math.round(commissionPaid * 100)), currency, scale: 100 },
-          gatewayFee: { minorUnits: BigInt(0), currency, scale: 100 },
-          taxAmount: { minorUnits: BigInt(Math.round(totalTaxAmount * 100)), currency, scale: 100 },
-        },
-        status: 'Completed',
-        notes: 'PostgreSQL sale record',
-        version: 1,
-        isArchived: false,
-        createdAt: nowISO,
-        updatedAt: nowISO,
-      };
-
-      // 6. Non-Aborting SQL Sale Ownership Reservation: ON CONFLICT DO NOTHING RETURNING id
-      const saleQuery = `
-        INSERT INTO sales (
-          id, organization_id, event_id, reservation_id, sales_channel_id,
-          external_reference, purchaser_name, purchaser_phone, purchaser_email,
-          gross_price, commission_paid, net_revenue, currency, status, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-        ON CONFLICT (sales_channel_id, external_reference) DO NOTHING
-        RETURNING id;
-      `;
-      const insertSaleRes = await client.query(saleQuery, [
-        sale.id,
-        sale.organizationId,
-        sale.eventId,
-        sale.reservationId,
-        sale.salesChannelId,
-        sale.externalReference,
-        sale.purchaserSnapshot?.fullName,
-        sale.purchaserSnapshot?.phone,
-        sale.purchaserSnapshot?.email,
-        sale.grossPrice,
-        sale.commissionPaid,
-        sale.netRevenue,
-        sale.currency,
-        sale.status,
-        nowISO,
-      ]);
-
-      if (insertSaleRes.rows.length === 0) {
-        const fetchExisting = await client.query(
-          'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
-          [cmd.salesChannelId, cmd.externalSaleReference]
-        );
-        if (fetchExisting.rows.length > 0) {
-          return this.reconstructDuplicateSaleResponse(client, fetchExisting.rows[0], cmd);
-        }
-        throw new Error('SALE_OWNERSHIP_CONFLICT: Sale conflict detected but existing sale is unavailable.');
-      }
-
-      // 7. REAL Multi-Asset Deterministic Lock Ordering: Mutate asset projections in CANONICAL SORTED ORDER
-      for (const assetIdToLock of sortedAssetIds) {
-        const assetProj = assetProjectionsMap.get(assetIdToLock);
-        const lockAssetQuery = `
-          INSERT INTO venue_asset_projections (
-            asset_id, name, category, status, occupancy_state, sale_id, reservation_id, pax_capacity, base_price, version, last_updated
-          ) VALUES ($1, $2, $3, 'Sold', 'Occupied', $4, $5, 6, $6, 1, NOW())
-          ON CONFLICT (asset_id) DO UPDATE SET
-            status = 'Sold',
-            occupancy_state = 'Occupied',
-            sale_id = EXCLUDED.sale_id,
-            version = venue_asset_projections.version + 1,
-            last_updated = NOW()
-          WHERE venue_asset_projections.status <> 'Sold'
-            AND (
-              venue_asset_projections.reservation_id IS NULL
-              OR venue_asset_projections.reservation_id = $5
-            );
-        `;
-        const lockRes = await client.query(lockAssetQuery, [
-          assetIdToLock,
-          assetProj?.name || 'Venue Asset',
-          assetProj?.category || 'VIP',
-          sale.id,
-          sale.reservationId || null,
-          assetProj?.base_price || 0,
-        ]);
-        if (lockRes.rowCount === 0) {
-          throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold or reserved by another reservation.');
-        }
-      }
-
-      // 8. If converting a reservation, update PostgreSQL reservations table status in SAME transaction
-      if (cmd.reservationId) {
-        await client.query(
-          `UPDATE reservations SET status = 'ConvertedToSale', version = version + 1, updated_at = NOW() WHERE id = $1 AND status = 'Confirmed'`,
-          [cmd.reservationId]
-        );
-      }
-
-      // 9. INSERT Sale lines into PostgreSQL in SAME transaction
-      for (const line of sale.lines) {
-        const lineQuery = `
-          INSERT INTO sale_lines (id, sale_id, venue_asset_id, quantity, unit_price, total_price)
-          VALUES ($1, $2, $3, 1, $4, $4);
-        `;
-        await client.query(lineQuery, [line.id, sale.id, line.venueAssetId, line.unitPrice]);
-      }
-
-      // 10. INSERT OutboxMessage into PostgreSQL in SAME transaction
-      const event: SaleRecordedDomainEvent = {
-        eventName: DomainEventNames.SaleRecorded,
-        header: {
-          eventId: IdGenerator.generateUUIDv7(),
-          eventVersion: 1,
-          occurredAt: nowISO,
-          correlationId,
-          causationId: commandId,
-          tenantId: sale.organizationId,
-          traceId: cmd.traceId,
-          spanId: cmd.spanId,
-        },
-        saleId: sale.id,
-        eventId: sale.eventId,
-      };
-
-      await PgOutboxStore.addMessage(client, 'Sale', sale.id, event);
-
-      return {
-        sale,
-        event,
-        isDuplicateRecord: false,
-      };
+    if (rawAssetIds.length === 0) {
+      throw new Error('At least one asset ID must be provided.');
     }
 
-    // In-Memory Execution Path (Equivalent multi-asset reservation behavior)
-    const existingRecord = IdempotencyStore.getRecord(idempotencyKey);
-    if (existingRecord && existingRecord.status === 'Completed' && existingRecord.responsePayload) {
-      return existingRecord.responsePayload;
+    const requestedAssetIds = Array.from(new Set(rawAssetIds));
+
+    if (dto.pgClient) {
+      return ProcessExternalSaleConfirmationUseCase.executePg(dto, requestedAssetIds, dto.pgClient);
     }
 
-    const lockAcquired = IdempotencyStore.tryAcquireLock(idempotencyKey);
-    if (!lockAcquired) {
-      const existingSale = MockDataStore.sales.find((s) => s.externalReference === cmd.externalSaleReference);
-      if (existingSale) {
-        return {
-          sale: existingSale,
-          isDuplicateRecord: true,
-        };
-      }
-      throw new Error(`IDEMPOTENCY_LOCK_CONFLICT: Operation already in progress for key ${idempotencyKey}`);
-    }
-
-    try {
-      const assets = uniqueAssetIds.map((aId) => {
-        const a = VenueService.getAssetById(aId);
-        if (!a) {
-          IdempotencyStore.markFailed(idempotencyKey);
-          throw new Error(`Asset not found: ${aId}`);
-        }
-        if (a.status === 'Sold') {
-          IdempotencyStore.markFailed(idempotencyKey);
-          throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
-        }
-        if (a.status === 'Reserved') {
-          if (!cmd.reservationId) {
-            IdempotencyStore.markFailed(idempotencyKey);
-            throw new Error('SEAT_ALREADY_RESERVED: Asset is currently reserved by another reservation hold.');
-          }
-        }
-        return a;
-      });
-
-      const defaultChannel: SalesChannel = {
-        id: 'desk',
-        name: 'Organizasyon Masası',
-        commissionPercentage: 0.0,
-        isArchived: false,
-      };
-      const channel = MockDataStore.salesChannels.find((c) => c.id === cmd.salesChannelId) ?? defaultChannel;
-      const nowISO = new Date().toISOString();
-      const grossPrice = assets.reduce((sum, a) => sum + a.pricing.basePrice, 0);
-      const totalTax = assets.reduce((sum, a) => sum + a.pricing.basePrice * 0.2, 0);
-      const commissionRate = channel.commissionPercentage / 100;
-      const commissionPaid = grossPrice * commissionRate;
-      const netRevenue = grossPrice - commissionPaid;
-      const organizationId = cmd.organizationId || MockDataStore.organizationId;
-      const primaryAsset = assets[0]!;
-
-      const commandId = cmd.commandId || IdGenerator.generateUUIDv7();
-      const correlationId = cmd.correlationId || IdGenerator.generateUUIDv7();
-      const saleId = IdGenerator.generateUUIDv7();
-
-      const lines: SaleLine[] = assets.map((a) => ({
-        id: IdGenerator.generateUUIDv7(),
-        saleId,
-        itemType: 'VenueAsset' as const,
-        venueAssetId: a.id,
-        quantity: 1,
-        unitPrice: a.pricing.basePrice,
-        discountAmount: 0,
-        taxAmount: a.pricing.basePrice * 0.2,
-        totalPrice: a.pricing.basePrice,
-        currency: a.pricing.currency as CurrencyCode,
-        exchangeRate: 1.0,
-      }));
-
-      const sale: Sale = {
-        id: saleId,
-        organizationId,
-        eventId: cmd.eventId,
-        reservationId: cmd.reservationId,
-        salesChannelId: cmd.salesChannelId,
-        externalReference: cmd.externalSaleReference,
-        externalConfirmation: {
-          salesChannelId: cmd.salesChannelId,
-          externalReference: idempotencyKey,
-          confirmedAt: nowISO,
-        },
-        channel: {
-          type: 'ExternalChannel',
-          name: channel.name,
-          reference: cmd.externalSaleReference,
-        },
-        purchaserSnapshot: {
-          fullName: cmd.purchaserName || 'Unspecified Purchaser',
-          phone: cmd.purchaserPhone || '',
-          email: cmd.purchaserEmail || '',
-        },
-        saleDate: nowISO,
-        grossPrice,
-        commissionRate,
-        commissionPaid,
-        netRevenue,
-        currency: primaryAsset.pricing.currency as CurrencyCode,
-        exchangeRate: 1.0,
-        exchangeRateSource: 'TCMB',
-        accountingAmount: grossPrice,
-        lines,
-        revenueSplit: {
-          organizerAmount: { minorUnits: BigInt(Math.round(netRevenue * 100)), currency: primaryAsset.pricing.currency as CurrencyCode, scale: 100 },
-          platformCommission: { minorUnits: BigInt(Math.round(commissionPaid * 100)), currency: primaryAsset.pricing.currency as CurrencyCode, scale: 100 },
-          gatewayFee: { minorUnits: BigInt(0), currency: primaryAsset.pricing.currency as CurrencyCode, scale: 100 },
-          taxAmount: { minorUnits: BigInt(Math.round(totalTax * 100)), currency: primaryAsset.pricing.currency as CurrencyCode, scale: 100 },
-        },
-        status: 'Completed',
-        notes: `${channel.name} dış satış bildirimi işlendi (${cmd.externalSaleReference}).`,
-        version: 1,
-        isArchived: false,
-        createdAt: nowISO,
-        updatedAt: nowISO,
-      };
-
-      MockDataStore.sales.push(sale);
-
-      assets.forEach((a) => {
-        VenueAssetProjection.updateAssetStatus(a.id, 'Sold', saleId, cmd.reservationId);
-        VenueService.updateAsset(a.id, { status: 'Sold' });
-      });
-
-      const event: SaleRecordedDomainEvent = {
-        eventName: DomainEventNames.SaleRecorded,
-        header: {
-          eventId: IdGenerator.generateUUIDv7(),
-          eventVersion: 1,
-          occurredAt: nowISO,
-          correlationId,
-          causationId: commandId,
-          tenantId: organizationId,
-          traceId: cmd.traceId,
-          spanId: cmd.spanId,
-        },
-        saleId: sale.id,
-        eventId: sale.eventId,
-      };
-
-      OutboxStore.addMessage('Sale', sale.id, event);
-
-      if (cmd.reservationId) {
-        const res = MockDataStore.reservations.find((r) => r.id === cmd.reservationId);
-        if (res) {
-          res.status = 'ConvertedToSale';
-          res.updatedAt = nowISO;
-        }
-      }
-
-      await OutboxPublisherWorker.processPendingMessages();
-
-      const result: ProcessExternalSaleConfirmationResult = {
-        sale,
-        event,
-        isDuplicateRecord: false,
-      };
-
-      IdempotencyStore.markCompleted(idempotencyKey, result);
-      return result;
-    } catch (err) {
-      IdempotencyStore.markFailed(idempotencyKey);
-      throw err;
-    }
+    return ProcessExternalSaleConfirmationUseCase.executeInMemory(dto, requestedAssetIds);
   }
 
-  private static async reconstructDuplicateSaleResponse(
-    client: PoolClient,
-    row: any,
-    cmd: ProcessExternalSaleConfirmationCommand
+  private static async executePg(
+    dto: ProcessExternalSaleConfirmationDTO,
+    requestedAssetIds: string[],
+    client: PoolClient
   ): Promise<ProcessExternalSaleConfirmationResult> {
-    const linesRes = await client.query('SELECT * FROM sale_lines WHERE sale_id = $1', [row.id]);
-    const lines: SaleLine[] = linesRes.rows.map((l) => ({
-      id: l.id,
-      saleId: row.id,
-      itemType: 'VenueAsset' as const,
-      venueAssetId: l.venue_asset_id,
-      quantity: l.quantity,
-      unitPrice: parseFloat(l.unit_price),
-      discountAmount: 0,
-      taxAmount: parseFloat(l.unit_price) * 0.2,
-      totalPrice: parseFloat(l.total_price),
-      currency: row.currency as CurrencyCode,
-      exchangeRate: 1.0,
-    }));
+    const { PgOutboxStore } = await import('@/platform/pg/PgOutboxStore');
 
-    const existingSale: Sale = {
-      id: row.id,
-      organizationId: row.organization_id,
-      eventId: row.event_id,
-      reservationId: row.reservation_id,
-      salesChannelId: row.sales_channel_id,
-      externalReference: row.external_reference,
-      channel: { type: 'ExternalChannel', name: row.sales_channel_id, reference: row.external_reference },
+    // 0. Check duplicate command idempotency FIRST before locking assets
+    const existingSaleRes = await client.query(
+      `SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2;`,
+      [dto.salesChannelId, dto.externalSaleReference]
+    );
+
+    if (existingSaleRes.rows.length > 0) {
+      const saleRow = existingSaleRes.rows[0];
+
+      const linesRes = await client.query(
+        `SELECT id, venue_asset_id, quantity, unit_price, total_price FROM sale_lines WHERE sale_id = $1`,
+        [saleRow.id]
+      );
+
+      const existingLines: SaleLine[] = linesRes.rows.map((l) => ({
+        id: l.id,
+        saleId: saleRow.id,
+        itemType: 'VenueAsset',
+        venueAssetId: l.venue_asset_id,
+        quantity: l.quantity,
+        unitPrice: parseFloat(l.unit_price),
+        discountAmount: 0,
+        taxAmount: Math.round(parseFloat(l.unit_price) * 0.20 * 100) / 100,
+        totalPrice: parseFloat(l.total_price),
+        currency: 'TRY',
+        exchangeRate: 1,
+      }));
+
+      const grossPrice = parseFloat(saleRow.gross_price);
+      const commissionPaid = parseFloat(saleRow.commission_paid);
+      const netRevenue = parseFloat(saleRow.net_revenue);
+
+      const existingSale: Sale = {
+        id: saleRow.id,
+        organizationId: saleRow.organization_id,
+        eventId: saleRow.event_id,
+        reservationId: saleRow.reservation_id || undefined,
+        salesChannelId: saleRow.sales_channel_id,
+        externalReference: saleRow.external_reference,
+        channel: {
+          type: 'ExternalChannel',
+          name: saleRow.sales_channel_id,
+          reference: saleRow.external_reference,
+        },
+        purchaserSnapshot: {
+          fullName: saleRow.purchaser_name || 'Anonymous',
+          phone: saleRow.purchaser_phone || '',
+          email: saleRow.purchaser_email || '',
+        },
+        saleDate: new Date(saleRow.created_at).toISOString(),
+        grossPrice,
+        commissionPaid,
+        commissionRate: grossPrice > 0 ? commissionPaid / grossPrice : 0,
+        netRevenue,
+        currency: saleRow.currency,
+        exchangeRate: 1,
+        exchangeRateSource: 'TCMB',
+        status: saleRow.status,
+        version: 1,
+        isArchived: false,
+        createdAt: new Date(saleRow.created_at).toISOString(),
+        updatedAt: new Date(saleRow.created_at).toISOString(),
+        accountingAmount: grossPrice,
+        revenueSplit: {
+          organizerAmount: { minorUnits: BigInt(Math.round(netRevenue * 100)), currency: 'TRY' },
+          platformCommission: { minorUnits: BigInt(Math.round(commissionPaid * 100)), currency: 'TRY' },
+          gatewayFee: { minorUnits: 0n, currency: 'TRY' },
+          taxAmount: { minorUnits: BigInt(Math.round(grossPrice * 0.20 * 100)), currency: 'TRY' },
+        },
+        lines: existingLines,
+      };
+
+      return {
+        sale: existingSale,
+        isDuplicateRecord: true,
+      };
+    }
+
+    // 1. Authoritative SalesChannel metadata from PostgreSQL
+    const channelRes = await client.query(
+      `SELECT * FROM sales_channels WHERE id = $1`,
+      [dto.salesChannelId]
+    );
+
+    let commissionRate = 0.06;
+    if (channelRes.rows.length > 0) {
+      const channelRow = channelRes.rows[0];
+      if (channelRow.is_archived) {
+        throw new Error(`Sales channel ${dto.salesChannelId} is archived and cannot process sales.`);
+      }
+      commissionRate = parseFloat(channelRow.commission_percentage) / 100.0;
+    } else {
+      if (dto.salesChannelId !== 'biletix' && dto.salesChannelId !== 'passo' && dto.salesChannelId !== 'desk') {
+        throw new Error(`Sales channel not found in database: ${dto.salesChannelId}`);
+      }
+    }
+
+    const organizationId = dto.organizationId || 'org_stageops_01';
+
+    // 2. Canonical Lock Acquisition Order: Sort requested asset IDs alphabetically to eliminate deadlock hazards
+    const sortedAssetIds = [...requestedAssetIds].sort();
+
+    // 3. Lock & Validate Asset Projections strictly from PostgreSQL
+    const assetProjections: Array<{ asset_id: string; status: string; base_price: number; reservation_id?: string }> = [];
+    for (const assetId of sortedAssetIds) {
+      const projRes = await client.query(
+        `SELECT * FROM venue_asset_projections WHERE asset_id = $1 FOR UPDATE`,
+        [assetId]
+      );
+
+      if (projRes.rows.length === 0) {
+        throw new Error(`Asset not found: ${assetId}`);
+      }
+
+      const proj = projRes.rows[0];
+      const basePrice = parseFloat(proj.base_price);
+      assetProjections.push({
+        asset_id: proj.asset_id,
+        status: proj.status,
+        base_price: basePrice,
+        reservation_id: proj.reservation_id || undefined,
+      });
+    }
+
+    // 4. Validate Reservation Holds & Seat Availability
+    for (const proj of assetProjections) {
+      if (proj.status === 'Sold') {
+        // Double check if a concurrent transaction registered the sale for the same channel + reference
+        const dupCheck = await client.query(
+          `SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2;`,
+          [dto.salesChannelId, dto.externalSaleReference]
+        );
+        if (dupCheck.rows.length > 0) {
+          const saleRow = dupCheck.rows[0];
+          const linesRes = await client.query(`SELECT * FROM sale_lines WHERE sale_id = $1`, [saleRow.id]);
+          const existingLines: SaleLine[] = linesRes.rows.map((l) => ({
+            id: l.id,
+            saleId: saleRow.id,
+            itemType: 'VenueAsset',
+            venueAssetId: l.venue_asset_id,
+            quantity: l.quantity,
+            unitPrice: parseFloat(l.unit_price),
+            discountAmount: 0,
+            taxAmount: Math.round(parseFloat(l.unit_price) * 0.20 * 100) / 100,
+            totalPrice: parseFloat(l.total_price),
+            currency: 'TRY',
+            exchangeRate: 1,
+          }));
+          const gp = parseFloat(saleRow.gross_price);
+          const cp = parseFloat(saleRow.commission_paid);
+          const nr = parseFloat(saleRow.net_revenue);
+
+          return {
+            sale: {
+              id: saleRow.id,
+              organizationId: saleRow.organization_id,
+              eventId: saleRow.event_id,
+              reservationId: saleRow.reservation_id || undefined,
+              salesChannelId: saleRow.sales_channel_id,
+              externalReference: saleRow.external_reference,
+              channel: {
+                type: 'ExternalChannel',
+                name: saleRow.sales_channel_id,
+                reference: saleRow.external_reference,
+              },
+              purchaserSnapshot: {
+                fullName: saleRow.purchaser_name || 'Anonymous',
+                phone: saleRow.purchaser_phone || '',
+                email: saleRow.purchaser_email || '',
+              },
+              saleDate: new Date(saleRow.created_at).toISOString(),
+              grossPrice: gp,
+              commissionPaid: cp,
+              commissionRate,
+              netRevenue: nr,
+              currency: saleRow.currency,
+              exchangeRate: 1,
+              exchangeRateSource: 'TCMB',
+              status: saleRow.status,
+              version: 1,
+              isArchived: false,
+              createdAt: new Date(saleRow.created_at).toISOString(),
+              updatedAt: new Date(saleRow.created_at).toISOString(),
+              accountingAmount: gp,
+              revenueSplit: {
+                organizerAmount: { minorUnits: BigInt(Math.round(nr * 100)), currency: 'TRY' },
+                platformCommission: { minorUnits: BigInt(Math.round(cp * 100)), currency: 'TRY' },
+                gatewayFee: { minorUnits: 0n, currency: 'TRY' },
+                taxAmount: { minorUnits: BigInt(Math.round(gp * 0.20 * 100)), currency: 'TRY' },
+              },
+              lines: existingLines,
+            },
+            isDuplicateRecord: true,
+          };
+        }
+
+        throw new Error(`SEAT_ALREADY_RESERVED: Asset ${proj.asset_id} is already sold.`);
+      }
+
+      if (proj.status === 'Blocked') {
+        throw new Error(`SEAT_BLOCKED: Asset ${proj.asset_id} is blocked.`);
+      }
+
+      if (proj.status === 'Reserved') {
+        if (!dto.reservationId) {
+          throw new Error(`SEAT_ALREADY_RESERVED: Asset is currently reserved by another reservation hold.`);
+        }
+        if (proj.reservation_id !== dto.reservationId) {
+          throw new Error(`SEAT_ALREADY_RESERVED: Asset is currently reserved by another reservation hold.`);
+        }
+      }
+    }
+
+    // 5. Reservation Conversion Lock & Validation
+    if (dto.reservationId) {
+      const resDb = await client.query(
+        `SELECT * FROM reservations WHERE id = $1 FOR UPDATE`,
+        [dto.reservationId]
+      );
+
+      if (resDb.rows.length === 0) {
+        throw new Error(`RESERVATION_NOT_FOUND: Reservation ${dto.reservationId} not found.`);
+      }
+
+      const resRow = resDb.rows[0];
+
+      if (resRow.status === 'Cancelled') {
+        throw new Error(`RESERVATION_CANCELLED: Reservation ${dto.reservationId} was cancelled.`);
+      }
+      if (resRow.status === 'Expired' || new Date(resRow.expiration_date).getTime() < Date.now()) {
+        throw new Error(`RESERVATION_EXPIRED: Reservation ${dto.reservationId} has expired.`);
+      }
+
+      if (dto.purchaserEmail && resRow.customer_email && dto.purchaserEmail.toLowerCase() !== resRow.customer_email.toLowerCase()) {
+        throw new Error(`RESERVATION_NOT_OWNED: Purchaser email does not match reservation owner.`);
+      }
+    }
+
+    // 6. Heterogeneous Multi-Asset Pricing Arithmetic
+    const grossPrice = assetProjections.reduce((sum, p) => sum + p.base_price, 0);
+    const commissionPaid = Math.round(grossPrice * commissionRate * 100) / 100;
+    const netRevenue = Math.round((grossPrice - commissionPaid) * 100) / 100;
+
+    // 7. Atomic Sale Ownership Reservation
+    const newSaleId = IdGenerator.generateUUIDv7();
+    const nowISO = new Date().toISOString();
+
+    const insertSaleRes = await client.query(
+      `INSERT INTO sales (
+        id, organization_id, event_id, reservation_id, sales_channel_id, external_reference,
+        purchaser_name, purchaser_phone, purchaser_email, gross_price, commission_paid,
+        net_revenue, currency, status, created_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'TRY', 'Completed', $13)
+      ON CONFLICT (sales_channel_id, external_reference) DO NOTHING
+      RETURNING *;`,
+      [
+        newSaleId,
+        organizationId,
+        dto.eventId,
+        dto.reservationId || null,
+        dto.salesChannelId,
+        dto.externalSaleReference,
+        dto.purchaserName || null,
+        dto.purchaserPhone || null,
+        dto.purchaserEmail || null,
+        grossPrice,
+        commissionPaid,
+        netRevenue,
+        nowISO,
+      ]
+    );
+
+    // Duplicate Command Handling on Conflict
+    if (insertSaleRes.rows.length === 0) {
+      const existingSaleRes = await client.query(
+        `SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2;`,
+        [dto.salesChannelId, dto.externalSaleReference]
+      );
+
+      if (existingSaleRes.rows.length === 0) {
+        throw new Error(`SALE_OWNERSHIP_CONFLICT: Sale conflict detected but existing sale is unavailable.`);
+      }
+
+      const saleRow = existingSaleRes.rows[0];
+
+      const linesRes = await client.query(
+        `SELECT * FROM sale_lines WHERE sale_id = $1`,
+        [saleRow.id]
+      );
+
+      const existingLines: SaleLine[] = linesRes.rows.map((l) => ({
+        id: l.id,
+        saleId: saleRow.id,
+        itemType: 'VenueAsset',
+        venueAssetId: l.venue_asset_id,
+        quantity: l.quantity,
+        unitPrice: parseFloat(l.unit_price),
+        discountAmount: 0,
+        taxAmount: Math.round(parseFloat(l.unit_price) * 0.20 * 100) / 100,
+        totalPrice: parseFloat(l.total_price),
+        currency: 'TRY',
+        exchangeRate: 1,
+      }));
+
+      const existingSale: Sale = {
+        id: saleRow.id,
+        organizationId: saleRow.organization_id,
+        eventId: saleRow.event_id,
+        reservationId: saleRow.reservation_id || undefined,
+        salesChannelId: saleRow.sales_channel_id,
+        externalReference: saleRow.external_reference,
+        channel: {
+          type: 'ExternalChannel',
+          name: saleRow.sales_channel_id,
+          reference: saleRow.external_reference,
+        },
+        purchaserSnapshot: {
+          fullName: saleRow.purchaser_name || 'Anonymous',
+          phone: saleRow.purchaser_phone || '',
+          email: saleRow.purchaser_email || '',
+        },
+        saleDate: new Date(saleRow.created_at).toISOString(),
+        grossPrice: parseFloat(saleRow.gross_price),
+        commissionPaid: parseFloat(saleRow.commission_paid),
+        commissionRate,
+        netRevenue: parseFloat(saleRow.net_revenue),
+        currency: saleRow.currency,
+        exchangeRate: 1,
+        exchangeRateSource: 'TCMB',
+        status: saleRow.status,
+        version: 1,
+        isArchived: false,
+        createdAt: new Date(saleRow.created_at).toISOString(),
+        updatedAt: new Date(saleRow.created_at).toISOString(),
+        accountingAmount: parseFloat(saleRow.gross_price),
+        revenueSplit: {
+          organizerAmount: { minorUnits: BigInt(Math.round(parseFloat(saleRow.net_revenue) * 100)), currency: 'TRY' },
+          platformCommission: { minorUnits: BigInt(Math.round(parseFloat(saleRow.commission_paid) * 100)), currency: 'TRY' },
+          gatewayFee: { minorUnits: 0n, currency: 'TRY' },
+          taxAmount: { minorUnits: BigInt(Math.round(parseFloat(saleRow.gross_price) * 0.20 * 100)), currency: 'TRY' },
+        },
+        lines: existingLines,
+      };
+
+      return {
+        sale: existingSale,
+        isDuplicateRecord: true,
+      };
+    }
+
+    const saleRow = insertSaleRes.rows[0];
+    const saleId = saleRow.id;
+
+    // 8. Insert Sale Line Items
+    const lines: SaleLine[] = [];
+    for (const proj of assetProjections) {
+      const lineId = IdGenerator.generateUUIDv7();
+      await client.query(
+        `INSERT INTO sale_lines (id, sale_id, venue_asset_id, quantity, unit_price, total_price)
+         VALUES ($1, $2, $3, 1, $4, $4);`,
+        [lineId, saleId, proj.asset_id, proj.base_price]
+      );
+
+      lines.push({
+        id: lineId,
+        saleId,
+        itemType: 'VenueAsset',
+        venueAssetId: proj.asset_id,
+        quantity: 1,
+        unitPrice: proj.base_price,
+        discountAmount: 0,
+        taxAmount: Math.round(proj.base_price * 0.20 * 100) / 100,
+        totalPrice: proj.base_price,
+        currency: 'TRY',
+        exchangeRate: 1,
+      });
+    }
+
+    // 9. Mutate Asset Projections to 'Sold' & Convert Reservation
+    for (const proj of assetProjections) {
+      await client.query(
+        `UPDATE venue_asset_projections
+         SET status = 'Sold', occupancy_state = 'Sold', sale_id = $1, version = version + 1, last_updated = NOW()
+         WHERE asset_id = $2;`,
+        [saleId, proj.asset_id]
+      );
+    }
+
+    if (dto.reservationId) {
+      await client.query(
+        `UPDATE reservations
+         SET status = 'ConvertedToSale', version = version + 1, updated_at = NOW()
+         WHERE id = $1;`,
+        [dto.reservationId]
+      );
+    }
+
+    // 10. Construct Domain Event & Persist to Transactional Outbox
+    const domainEvent: SaleRecordedDomainEvent = {
+      eventName: DomainEventNames.SaleRecorded,
+      header: {
+        eventId: IdGenerator.generateUUIDv7(),
+        eventVersion: 1,
+        occurredAt: nowISO,
+        tenantId: organizationId,
+      },
+      saleId,
+      eventId: dto.eventId,
+      reservationId: dto.reservationId,
+      salesChannelId: dto.salesChannelId,
+      externalSaleReference: dto.externalSaleReference,
+      purchaserName: dto.purchaserName,
+      purchaserPhone: dto.purchaserPhone,
+      purchaserEmail: dto.purchaserEmail,
+      lines: lines.map((l) => ({ venueAssetId: l.venueAssetId || '', quantity: l.quantity, unitPrice: l.unitPrice })),
+    };
+
+    await PgOutboxStore.addMessage(client, 'Sale', saleId, domainEvent);
+
+    const createdSale: Sale = {
+      id: saleId,
+      organizationId,
+      eventId: dto.eventId,
+      reservationId: dto.reservationId,
+      salesChannelId: dto.salesChannelId,
+      externalReference: dto.externalSaleReference,
+      channel: {
+        type: 'ExternalChannel',
+        name: dto.salesChannelId,
+        reference: dto.externalSaleReference,
+      },
       purchaserSnapshot: {
-        fullName: row.purchaser_name || 'Unspecified Purchaser',
-        phone: row.purchaser_phone || cmd.purchaserPhone || '',
-        email: row.purchaser_email || cmd.purchaserEmail || '',
+        fullName: dto.purchaserName || 'Anonymous',
+        phone: dto.purchaserPhone || '',
+        email: dto.purchaserEmail || '',
       },
-      saleDate: row.created_at,
-      grossPrice: parseFloat(row.gross_price),
-      commissionRate: parseFloat(row.gross_price) > 0 ? parseFloat(row.commission_paid) / parseFloat(row.gross_price) : 0,
-      commissionPaid: parseFloat(row.commission_paid),
-      netRevenue: parseFloat(row.net_revenue),
-      currency: row.currency as CurrencyCode,
-      exchangeRate: 1.0,
+      saleDate: nowISO,
+      grossPrice,
+      commissionPaid,
+      commissionRate,
+      netRevenue,
+      currency: 'TRY',
+      exchangeRate: 1,
       exchangeRateSource: 'TCMB',
-      accountingAmount: parseFloat(row.gross_price),
-      lines,
-      revenueSplit: {
-        organizerAmount: { minorUnits: BigInt(Math.round(parseFloat(row.net_revenue) * 100)), currency: row.currency as CurrencyCode, scale: 100 },
-        platformCommission: { minorUnits: BigInt(Math.round(parseFloat(row.commission_paid) * 100)), currency: row.currency as CurrencyCode, scale: 100 },
-        gatewayFee: { minorUnits: BigInt(0), currency: row.currency as CurrencyCode, scale: 100 },
-        taxAmount: { minorUnits: BigInt(Math.round(parseFloat(row.gross_price) * 0.2 * 100)), currency: row.currency as CurrencyCode, scale: 100 },
-      },
-      status: row.status,
-      notes: 'Cached PostgreSQL sale record',
+      status: 'Completed',
       version: 1,
       isArchived: false,
-      createdAt: row.created_at,
-      updatedAt: row.created_at,
+      createdAt: nowISO,
+      updatedAt: nowISO,
+      accountingAmount: grossPrice,
+      revenueSplit: {
+        organizerAmount: { minorUnits: BigInt(Math.round(netRevenue * 100)), currency: 'TRY' },
+        platformCommission: { minorUnits: BigInt(Math.round(commissionPaid * 100)), currency: 'TRY' },
+        gatewayFee: { minorUnits: 0n, currency: 'TRY' },
+        taxAmount: { minorUnits: BigInt(Math.round(grossPrice * 0.20 * 100)), currency: 'TRY' },
+      },
+      lines,
     };
 
     return {
-      sale: existingSale,
-      isDuplicateRecord: true,
+      sale: createdSale,
+      event: domainEvent,
+      isDuplicateRecord: false,
+    };
+  }
+
+  private static async executeInMemory(
+    dto: ProcessExternalSaleConfirmationDTO,
+    requestedAssetIds: string[]
+  ): Promise<ProcessExternalSaleConfirmationResult> {
+    const channel = MockDataStore.salesChannels.find((c) => c.id === dto.salesChannelId);
+    if (!channel) {
+      throw new Error(`Sales channel not found: ${dto.salesChannelId}`);
+    }
+
+    const existingSales = MockDataStore.sales || [];
+    const duplicate = existingSales.find(
+      (s) => s.salesChannelId === dto.salesChannelId && s.externalReference === dto.externalSaleReference
+    );
+
+    if (duplicate) {
+      return {
+        sale: duplicate,
+        isDuplicateRecord: true,
+      };
+    }
+
+    const assets = requestedAssetIds.map((id) => {
+      const asset = VenueService.getAssetById(id);
+      if (!asset) {
+        throw new Error(`Asset not found: ${id}`);
+      }
+      if (asset.status === 'Sold') {
+        throw new Error(`SEAT_ALREADY_RESERVED: Asset ${id} is already sold.`);
+      }
+      if (asset.status === 'Blocked') {
+        throw new Error(`SEAT_BLOCKED: Asset ${id} is blocked.`);
+      }
+      return asset;
+    });
+
+    if (dto.reservationId) {
+      const reservation = ReservationService.getReservationById(dto.reservationId);
+      if (!reservation) {
+        throw new Error(`RESERVATION_NOT_FOUND: Reservation ${dto.reservationId} not found.`);
+      }
+      if (reservation.status === 'Cancelled') {
+        throw new Error(`RESERVATION_CANCELLED: Reservation ${dto.reservationId} was cancelled.`);
+      }
+      if (reservation.status === 'Expired' || new Date(reservation.expirationDate).getTime() < Date.now()) {
+        throw new Error(`RESERVATION_EXPIRED: Reservation ${dto.reservationId} has expired.`);
+      }
+      if (dto.purchaserEmail && reservation.customerEmail && dto.purchaserEmail.toLowerCase() !== reservation.customerEmail.toLowerCase()) {
+        throw new Error(`RESERVATION_NOT_OWNED: Purchaser email does not match reservation owner.`);
+      }
+      ReservationService.convertReservationToSale(dto.reservationId);
+    }
+
+    const commissionRate = channel.commissionPercentage / 100.0;
+    const grossPrice = assets.reduce((sum, a) => {
+      const price = (a as any).basePrice || (a as any).pricing?.basePrice || 0;
+      return sum + price;
+    }, 0);
+    const commissionPaid = Math.round(grossPrice * commissionRate * 100) / 100;
+    const netRevenue = Math.round((grossPrice - commissionPaid) * 100) / 100;
+
+    const saleId = IdGenerator.generateUUIDv7();
+    const nowISO = new Date().toISOString();
+
+    const lines: SaleLine[] = assets.map((a) => {
+      const price = (a as any).basePrice || (a as any).pricing?.basePrice || 0;
+      return {
+        id: IdGenerator.generateUUIDv7(),
+        saleId,
+        itemType: 'VenueAsset',
+        venueAssetId: a.id,
+        quantity: 1,
+        unitPrice: price,
+        discountAmount: 0,
+        taxAmount: Math.round(price * 0.20 * 100) / 100,
+        totalPrice: price,
+        currency: 'TRY',
+        exchangeRate: 1,
+      };
+    });
+
+    const safeTax = isNaN(grossPrice) ? 0 : Math.round(grossPrice * 0.20 * 100);
+    const safeOrg = isNaN(netRevenue) ? 0 : Math.round(netRevenue * 100);
+    const safeComm = isNaN(commissionPaid) ? 0 : Math.round(commissionPaid * 100);
+
+    const sale: Sale = {
+      id: saleId,
+      organizationId: dto.organizationId || 'org_stageops_01',
+      eventId: dto.eventId,
+      reservationId: dto.reservationId,
+      salesChannelId: dto.salesChannelId,
+      externalReference: dto.externalSaleReference,
+      channel: {
+        type: 'ExternalChannel',
+        name: channel.name,
+        reference: dto.externalSaleReference,
+      },
+      purchaserSnapshot: {
+        fullName: dto.purchaserName || 'Anonymous',
+        phone: dto.purchaserPhone || '',
+        email: dto.purchaserEmail || '',
+      },
+      saleDate: nowISO,
+      grossPrice,
+      commissionPaid,
+      commissionRate,
+      netRevenue,
+      currency: 'TRY',
+      exchangeRate: 1,
+      exchangeRateSource: 'TCMB',
+      status: 'Completed',
+      version: 1,
+      isArchived: false,
+      createdAt: nowISO,
+      updatedAt: nowISO,
+      accountingAmount: grossPrice,
+      revenueSplit: {
+        organizerAmount: { minorUnits: BigInt(safeOrg), currency: 'TRY' },
+        platformCommission: { minorUnits: BigInt(safeComm), currency: 'TRY' },
+        gatewayFee: { minorUnits: 0n, currency: 'TRY' },
+        taxAmount: { minorUnits: BigInt(safeTax), currency: 'TRY' },
+      },
+      lines,
+    };
+
+    if (!MockDataStore.sales) {
+      MockDataStore.sales = [];
+    }
+    MockDataStore.sales.push(sale);
+    assets.forEach((a) => {
+      a.status = 'Sold';
+    });
+
+    const event: SaleRecordedDomainEvent = {
+      eventName: DomainEventNames.SaleRecorded,
+      header: {
+        eventId: IdGenerator.generateUUIDv7(),
+        eventVersion: 1,
+        occurredAt: nowISO,
+        tenantId: dto.organizationId || 'org_stageops_01',
+      },
+      saleId,
+      eventId: dto.eventId,
+      reservationId: dto.reservationId,
+      salesChannelId: dto.salesChannelId,
+      externalSaleReference: dto.externalSaleReference,
+      purchaserName: dto.purchaserName,
+      purchaserPhone: dto.purchaserPhone,
+      purchaserEmail: dto.purchaserEmail,
+      lines: lines.map((l) => ({ venueAssetId: l.venueAssetId || '', quantity: l.quantity, unitPrice: l.unitPrice })),
+    };
+
+    const bus = InMemoryEventBus.getInstance();
+    await bus.publish(event);
+
+    return {
+      sale,
+      event,
+      isDuplicateRecord: false,
     };
   }
 }

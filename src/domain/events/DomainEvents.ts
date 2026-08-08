@@ -16,6 +16,13 @@ export interface SaleRecordedDomainEvent extends DomainEvent {
   readonly header: EventHeader;
   readonly saleId: string;
   readonly eventId: string;
+  readonly reservationId?: string;
+  readonly salesChannelId?: string;
+  readonly externalSaleReference?: string;
+  readonly purchaserName?: string;
+  readonly purchaserPhone?: string;
+  readonly purchaserEmail?: string;
+  readonly lines?: Array<{ venueAssetId: string; quantity: number; unitPrice: number }>;
 }
 
 export interface ReservationPlacedDomainEvent extends DomainEvent {

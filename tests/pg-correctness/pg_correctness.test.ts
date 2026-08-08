@@ -1389,8 +1389,8 @@ describe('PostgreSQL Correctness Baseline (T1 - T69 Integration Tests)', () => {
 
     // 2. Verify individual line item pricing
     expect(result.sale.lines).toHaveLength(2);
-    const lineA = result.sale.lines.find((l) => l.venueAssetId === assetA);
-    const lineB = result.sale.lines.find((l) => l.venueAssetId === assetB);
+    const lineA = result.sale.lines.find((l: any) => l.venueAssetId === assetA);
+    const lineB = result.sale.lines.find((l: any) => l.venueAssetId === assetB);
 
     expect(lineA?.unitPrice).toBe(25000);
     expect(lineB?.unitPrice).toBe(45000);
@@ -1597,8 +1597,8 @@ describe('PostgreSQL Correctness Baseline (T1 - T69 Integration Tests)', () => {
     expect(sale.netRevenue).toBe(34780);
 
     // Tax amount per line (20% KDV on net base price)
-    const lineVip = sale.lines.find((l) => l.venueAssetId === 'asset_vip_a2');
-    const lineBistro = sale.lines.find((l) => l.venueAssetId === 'asset_bistro_b1');
+    const lineVip = sale.lines.find((l: any) => l.venueAssetId === 'asset_vip_a2');
+    const lineBistro = sale.lines.find((l: any) => l.venueAssetId === 'asset_bistro_b1');
 
     expect(lineVip?.taxAmount).toBe(5000);
     expect(lineBistro?.taxAmount).toBe(2400);
