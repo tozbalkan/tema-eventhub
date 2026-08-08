@@ -8,11 +8,15 @@ import { AccountingSaleRecordedHandler } from '@/accounting/application/handlers
 import { OperationsSaleRecordedHandler } from '@/operations/application/handlers/OperationsSaleRecordedHandler';
 import { ProcessExternalSaleConfirmationUseCase } from '@/services/ProcessExternalSaleConfirmationUseCase';
 import { DomainEventNames, SaleRecordedDomainEvent } from '@/domain/events/DomainEvents';
+import { DomainEvent } from '@/application/EventBus';
 import { IdGenerator } from '@/platform/IdGenerator';
+import { OutboxPublisherWorker, PgOutboxAdapter } from '@/platform/OutboxPublisherWorker';
+import { InMemoryEventBus } from '@/application/EventBus';
+import { VenueService } from '@/services/VenueService';
 import fs from 'fs';
 import path from 'path';
 
-describe('PostgreSQL Correctness Baseline (T1 - T39 Integration Tests)', () => {
+describe('PostgreSQL Correctness Baseline (T1 - T42 Integration Tests)', () => {
   let pool: Pool;
 
   beforeAll(async () => {
@@ -589,9 +593,14 @@ describe('PostgreSQL Correctness Baseline (T1 - T39 Integration Tests)', () => {
   });
 
   it('T19: Sold Asset Validation — Throws SEAT_ALREADY_RESERVED when asset status is Sold', async () => {
+    await pool.query(
+      `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
+       VALUES ('asset_vip_a1', 'VIP A1', 'VIP', 'Sold', 'Occupied', 6, 25000, 1, NOW());`
+    );
+
     const command = {
       eventId: 'event_gala_2026',
-      assetId: 'asset_vip_a1', // asset_vip_a1 has status 'Sold' in MockRepositories
+      assetId: 'asset_vip_a1',
       salesChannelId: 'biletix',
       externalSaleReference: 'BTX-SOLD-ASSET-001',
     };
@@ -1050,7 +1059,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T39 Integration Tests)', () => {
 
   it('T35: Multi-Asset Partial Lock Failure Atomicity — Complete rollback on any locked seat failure', async () => {
     const assetAvailable1 = 'asset_vip_a2';
-    const assetSold = 'asset_vip_a1'; // asset_vip_a1 is pre-populated/marked Sold
+    const assetSold = 'asset_vip_a1';
     const assetAvailable2 = 'asset_vip_a3';
 
     await pool.query(
@@ -1207,5 +1216,125 @@ describe('PostgreSQL Correctness Baseline (T1 - T39 Integration Tests)', () => {
         throw new Error(customBusinessError);
       })
     ).rejects.toThrow(customBusinessError);
+  });
+
+  it('T40: Database-Only Asset Projection Execution Test (P1-1 Fix Verification)', async () => {
+    const dbOnlyAssetId = 'asset_db_only_999';
+
+    // 1. Create asset projection ONLY in PostgreSQL venue_asset_projections table
+    await pool.query(
+      `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
+       VALUES ($1, 'DB Only Lounge Table', 'Lounge', 'Available', 'Vacant', 8, 45000, 1, NOW());`,
+      [dbOnlyAssetId]
+    );
+
+    // 2. Explicitly verify the asset is ABSENT from Node.js process memory / MockDataStore
+    const memoryAsset = VenueService.getAssetById(dbOnlyAssetId);
+    expect(memoryAsset).toBeUndefined();
+
+    // 3. Execute ProcessExternalSaleConfirmationUseCase through PostgreSQL path
+    const command = {
+      eventId: 'event_gala_2026',
+      assetId: dbOnlyAssetId,
+      salesChannelId: 'biletix',
+      externalSaleReference: 'BTX-DB-ONLY-001',
+      purchaserName: 'Deniz Yılmaz',
+    };
+
+    const result = await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+    );
+
+    // 4. Assert sale succeeded using DB authoritative data
+    expect(result.isDuplicateRecord).toBe(false);
+    expect(result.sale.grossPrice).toBe(45000);
+    expect(result.sale.lines[0]?.venueAssetId).toBe(dbOnlyAssetId);
+
+    // 5. Verify DB asset status mutated to 'Sold' in venue_asset_projections
+    const projRes = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', [dbOnlyAssetId]);
+    expect(projRes.rows[0].status).toBe('Sold');
+
+    // 6. Verify sale and sale_lines persisted in PostgreSQL
+    const saleRes = await pool.query('SELECT * FROM sales WHERE external_reference = $1', [command.externalSaleReference]);
+    const linesRes = await pool.query('SELECT * FROM sale_lines WHERE sale_id = $1', [saleRes.rows[0].id]);
+    expect(saleRes.rows.length).toBe(1);
+    expect(linesRes.rows.length).toBe(1);
+  });
+
+  it('T41: Multi-Asset Input Array Deduplication Test (P1-2 Fix Verification)', async () => {
+    const assetId = 'asset_vip_a2';
+
+    await pool.query(
+      `INSERT INTO venue_asset_projections (asset_id, name, category, status, occupancy_state, pax_capacity, base_price, version, last_updated)
+       VALUES ($1, 'VIP A2', 'VIP', 'Available', 'Vacant', 6, 25000, 1, NOW());`,
+      [assetId]
+    );
+
+    // Command submits the SAME asset ID twice in requestedAssetIds array
+    const command = {
+      eventId: 'event_gala_2026',
+      assetIds: [assetId, assetId],
+      salesChannelId: 'biletix',
+      externalSaleReference: 'BTX-DUP-INPUT-001',
+    };
+
+    // Execute through PostgreSQL path — should NOT throw SEAT_ALREADY_RESERVED self-conflict error!
+    const result = await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+    );
+
+    expect(result.isDuplicateRecord).toBe(false);
+    expect(result.sale.lines).toHaveLength(1);
+    expect(result.sale.lines[0]?.venueAssetId).toBe(assetId);
+
+    // Verify DB state consistency and Zero Overselling
+    const dbSales = await pool.query('SELECT * FROM sales WHERE external_reference = $1', [command.externalSaleReference]);
+    const dbLines = await pool.query('SELECT * FROM sale_lines WHERE sale_id = $1', [dbSales.rows[0].id]);
+    const projRes = await pool.query('SELECT * FROM venue_asset_projections WHERE asset_id = $1', [assetId]);
+
+    expect(dbSales.rows.length).toBe(1);
+    expect(dbLines.rows.length).toBe(1);
+    expect(projRes.rows[0].status).toBe('Sold');
+  });
+
+  it('T42: Outbox Publisher Worker PostgreSQL End-to-End Test (P1-3 Fix Verification)', async () => {
+    const eventId = IdGenerator.generateUUIDv7();
+    const saleId = IdGenerator.generateUUIDv7();
+    let eventDispatchedToBus = false;
+
+    const event: DomainEvent = {
+      eventName: 'TestT42OutboxEvent',
+      header: { eventId, eventVersion: 1, occurredAt: new Date().toISOString() },
+    };
+
+    // 1. Insert outbox message directly into PostgreSQL outbox_messages table
+    await UnitOfWork.execute((tx) => PgOutboxStore.addMessage(tx, 'Sale', saleId, event));
+
+    // 2. Register a subscriber on InMemoryEventBus
+    const bus = InMemoryEventBus.getInstance();
+    const handler = async (e: any) => {
+      if (e.header.eventId === eventId) {
+        eventDispatchedToBus = true;
+      }
+    };
+    bus.subscribe('TestT42OutboxEvent', handler);
+
+    try {
+      // 3. Instantiate real OutboxPublisherWorker configured with PgOutboxAdapter
+      const worker = new OutboxPublisherWorker(new PgOutboxAdapter(), 'worker_t42_pg');
+
+      // 4. Process pending outbox messages from PostgreSQL
+      const processedCount = await worker.processPendingMessages(10);
+      expect(processedCount).toBe(1);
+      expect(eventDispatchedToBus).toBe(true);
+
+      // 5. Query PostgreSQL outbox_messages table and verify state transitioned to 'Published'
+      const dbOutbox = await PgOutboxStore.getMessageById(eventId);
+      expect(dbOutbox?.status).toBe('Published');
+      expect(dbOutbox?.publishedAt).toBeDefined();
+      expect(dbOutbox?.leaseVersion).toBe(1);
+    } finally {
+      bus.unsubscribe('TestT42OutboxEvent', handler);
+    }
   });
 });

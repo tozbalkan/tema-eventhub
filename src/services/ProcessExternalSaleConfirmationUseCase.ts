@@ -1,6 +1,7 @@
 import { PoolClient } from 'pg';
 import { MockDataStore } from '@/repositories/mock/MockRepositories';
-import { Sale } from '@/types/sale';
+import { Sale, SaleLine } from '@/types/sale';
+import { CurrencyCode } from '@/types/money';
 import { SalesChannel } from '@/types/sales-channel';
 import { VenueService } from './VenueService';
 import { IdGenerator } from '@/platform/IdGenerator';
@@ -40,10 +41,11 @@ export interface ProcessExternalSaleConfirmationResult {
  * 
  * Production Transaction Flow (Multi-Asset Deterministic Deadlock-Free Pattern):
  * 1. Command Idempotency Check (SELECT existing sale for channel + reference)
- * 2. Asset existence & status pre-validation for all assets
- * 3. Reserve Sale Ownership FIRST (INSERT INTO sales ON CONFLICT DO NOTHING RETURNING id)
+ * 2. Database-Authoritative Asset existence & status pre-validation via venue_asset_projections
+ * 3. Non-Aborting Sale Ownership Reservation FIRST (INSERT INTO sales ON CONFLICT DO NOTHING RETURNING id)
  *    - If duplicate detected: Return existing sale payload WITHOUT mutating asset projections (Zero Phantom Side-Effects!)
- * 4. Deterministic Asset Lock Ordering ((assetIds || [assetId]).sort()) & Acquisition ONLY IF sale ownership was won!
+ * 4. Deterministic Asset Lock Ordering (sortedAssetIds = Array.from(new Set(assetIds)).sort()) & Acquisition ONLY IF sale ownership was won!
+ *    - Input array deduplicated to prevent duplicate line self-lock conflicts.
  *    - If any asset is already sold: Throw SEAT_ALREADY_RESERVED (triggers UnitOfWork ROLLBACK of step 3 sale insert)
  * 5. Persist Sale Lines & OutboxMessage in SAME PostgreSQL Transaction
  * 6. UnitOfWork commits cleanly without 23505 transaction abortion or deadlock hazards
@@ -54,6 +56,9 @@ export class ProcessExternalSaleConfirmationUseCase {
 
     const idempotencyKey = cmd.idempotencyKey || cmd.externalSaleReference;
     const requestedAssetIds = cmd.assetIds && cmd.assetIds.length > 0 ? cmd.assetIds : [cmd.assetId || ''];
+
+    // Deduplicate requested asset IDs for canonical lock ordering and line item processing (P1-2 Fix)
+    const uniqueAssetIds = Array.from(new Set(requestedAssetIds));
 
     // PostgreSQL Transactional Execution Path
     if (cmd.pgClient) {
@@ -69,13 +74,44 @@ export class ProcessExternalSaleConfirmationUseCase {
         return this.reconstructDuplicateSaleResponse(client, existingSaleRes.rows[0], cmd);
       }
 
-      // 2. Asset existence and status pre-validation for all requested assets
-      for (const currentAssetId of requestedAssetIds) {
-        const asset = VenueService.getAssetById(currentAssetId);
-        if (!asset) {
-          throw new Error(`Asset not found: ${currentAssetId}`);
+      // 2. Database-Authoritative Asset Validation (P1-1 Fix): Query venue_asset_projections directly in PostgreSQL!
+      const assetProjections: Array<{ asset_id: string; name: string; category: string; status: string; base_price: number; currency: CurrencyCode }> = [];
+
+      for (const currentAssetId of uniqueAssetIds) {
+        const dbAssetRes = await client.query(
+          'SELECT * FROM venue_asset_projections WHERE asset_id = $1',
+          [currentAssetId]
+        );
+
+        let assetObj: { asset_id: string; name: string; category: string; status: string; base_price: number; currency: CurrencyCode };
+
+        if (dbAssetRes.rows.length > 0) {
+          const row = dbAssetRes.rows[0];
+          assetObj = {
+            asset_id: row.asset_id,
+            name: row.name,
+            category: row.category || 'VIP',
+            status: row.status,
+            base_price: parseFloat(row.base_price || '0'),
+            currency: 'TRY', // Default currency for projections
+          };
+        } else {
+          // Fallback to memory store if present in legacy test fixtures
+          const mockAsset = VenueService.getAssetById(currentAssetId);
+          if (!mockAsset) {
+            throw new Error(`Asset not found: ${currentAssetId}`);
+          }
+          assetObj = {
+            asset_id: mockAsset.id,
+            name: mockAsset.name,
+            category: mockAsset.category || 'VIP',
+            status: mockAsset.status,
+            base_price: mockAsset.pricing.basePrice,
+            currency: (mockAsset.pricing.currency as CurrencyCode) || 'TRY',
+          };
         }
-        if (asset.status === 'Sold') {
+
+        if (assetObj.status === 'Sold') {
           const doubleCheckCommitted = await client.query(
             'SELECT * FROM sales WHERE sales_channel_id = $1 AND external_reference = $2',
             [cmd.salesChannelId, cmd.externalSaleReference]
@@ -85,11 +121,14 @@ export class ProcessExternalSaleConfirmationUseCase {
           }
           throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
         }
+
+        assetProjections.push(assetObj);
       }
 
-      const primaryAsset = VenueService.getAssetById(requestedAssetIds[0]!)!;
-      const unitPrice = primaryAsset.pricing.basePrice;
-      const grossPrice = unitPrice * requestedAssetIds.length;
+      const primaryAsset = assetProjections[0]!;
+      const unitPrice = primaryAsset.base_price;
+      const currency: CurrencyCode = primaryAsset.currency || 'TRY';
+      const grossPrice = unitPrice * uniqueAssetIds.length;
       const defaultChannel: SalesChannel = { id: 'desk', name: 'Organizasyon Masası', commissionPercentage: 0.0, isArchived: false };
       const channel = MockDataStore.salesChannels.find((c) => c.id === cmd.salesChannelId) ?? defaultChannel;
       const commissionRate = channel.commissionPercentage / 100;
@@ -101,19 +140,24 @@ export class ProcessExternalSaleConfirmationUseCase {
       const correlationId = cmd.correlationId || IdGenerator.generateUUIDv7();
       const saleId = IdGenerator.generateUUIDv7();
 
-      const lines = requestedAssetIds.map((aId) => ({
-        id: IdGenerator.generateUUIDv7(),
-        saleId,
-        itemType: 'VenueAsset' as const,
-        venueAssetId: aId,
-        quantity: 1,
-        unitPrice,
-        discountAmount: 0,
-        taxAmount: unitPrice * 0.2,
-        totalPrice: unitPrice,
-        currency: primaryAsset.pricing.currency,
-        exchangeRate: 1.0,
-      }));
+      const lines: SaleLine[] = uniqueAssetIds.map((aId) => {
+        const aProj = assetProjections.find((p) => p.asset_id === aId) || primaryAsset;
+        const linePrice = aProj.base_price;
+        const lineCurrency: CurrencyCode = aProj.currency || currency;
+        return {
+          id: IdGenerator.generateUUIDv7(),
+          saleId,
+          itemType: 'VenueAsset' as const,
+          venueAssetId: aId,
+          quantity: 1,
+          unitPrice: linePrice,
+          discountAmount: 0,
+          taxAmount: linePrice * 0.2,
+          totalPrice: linePrice,
+          currency: lineCurrency,
+          exchangeRate: 1.0,
+        };
+      });
 
       const sale: Sale = {
         id: saleId,
@@ -133,16 +177,16 @@ export class ProcessExternalSaleConfirmationUseCase {
         commissionRate,
         commissionPaid,
         netRevenue,
-        currency: primaryAsset.pricing.currency,
+        currency,
         exchangeRate: 1.0,
         exchangeRateSource: 'TCMB',
         accountingAmount: grossPrice,
         lines,
         revenueSplit: {
-          organizerAmount: { minorUnits: BigInt(Math.round(netRevenue * 100)), currency: primaryAsset.pricing.currency, scale: 100 },
-          platformCommission: { minorUnits: BigInt(Math.round(commissionPaid * 100)), currency: primaryAsset.pricing.currency, scale: 100 },
-          gatewayFee: { minorUnits: BigInt(0), currency: primaryAsset.pricing.currency, scale: 100 },
-          taxAmount: { minorUnits: BigInt(Math.round(grossPrice * 0.2 * 100)), currency: primaryAsset.pricing.currency, scale: 100 },
+          organizerAmount: { minorUnits: BigInt(Math.round(netRevenue * 100)), currency, scale: 100 },
+          platformCommission: { minorUnits: BigInt(Math.round(commissionPaid * 100)), currency, scale: 100 },
+          gatewayFee: { minorUnits: BigInt(0), currency, scale: 100 },
+          taxAmount: { minorUnits: BigInt(Math.round(grossPrice * 0.2 * 100)), currency, scale: 100 },
         },
         status: 'Completed',
         notes: 'PostgreSQL sale record',
@@ -190,14 +234,14 @@ export class ProcessExternalSaleConfirmationUseCase {
         }
       }
 
-      // 4. REAL Multi-Asset Deterministic Lock Ordering: Sort asset IDs deterministically BEFORE acquiring locks!
-      const sortedAssetIds = [...requestedAssetIds].sort();
+      // 4. REAL Multi-Asset Deterministic Lock Ordering (P1-2 Fix): Sort unique asset IDs deterministically BEFORE acquiring locks!
+      const sortedAssetIds = [...uniqueAssetIds].sort();
       for (const assetIdToLock of sortedAssetIds) {
-        const assetObj = VenueService.getAssetById(assetIdToLock);
+        const assetProj = assetProjections.find((p) => p.asset_id === assetIdToLock);
         const lockAssetQuery = `
           INSERT INTO venue_asset_projections (
             asset_id, name, category, status, occupancy_state, sale_id, reservation_id, pax_capacity, base_price, version, last_updated
-          ) VALUES ($1, $2, 'VIP', 'Sold', 'Occupied', $3, $4, 6, $5, 1, NOW())
+          ) VALUES ($1, $2, $3, 'Sold', 'Occupied', $4, $5, 6, $6, 1, NOW())
           ON CONFLICT (asset_id) DO UPDATE SET
             status = 'Sold',
             occupancy_state = 'Occupied',
@@ -208,10 +252,11 @@ export class ProcessExternalSaleConfirmationUseCase {
         `;
         const lockRes = await client.query(lockAssetQuery, [
           assetIdToLock,
-          assetObj?.name || 'Venue Asset',
+          assetProj?.name || 'Venue Asset',
+          assetProj?.category || 'VIP',
           sale.id,
           sale.reservationId,
-          assetObj?.pricing?.basePrice || unitPrice,
+          assetProj?.base_price || unitPrice,
         ]);
         if (lockRes.rowCount === 0) {
           throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
@@ -273,7 +318,7 @@ export class ProcessExternalSaleConfirmationUseCase {
     }
 
     try {
-      const primaryAssetId = requestedAssetIds[0]!;
+      const primaryAssetId = uniqueAssetIds[0]!;
       const asset = VenueService.getAssetById(primaryAssetId);
       if (!asset) {
         IdempotencyStore.markFailed(idempotencyKey);
@@ -412,7 +457,7 @@ export class ProcessExternalSaleConfirmationUseCase {
     cmd: ProcessExternalSaleConfirmationCommand
   ): Promise<ProcessExternalSaleConfirmationResult> {
     const linesRes = await client.query('SELECT * FROM sale_lines WHERE sale_id = $1', [row.id]);
-    const lines = linesRes.rows.map((l) => ({
+    const lines: SaleLine[] = linesRes.rows.map((l) => ({
       id: l.id,
       saleId: row.id,
       itemType: 'VenueAsset' as const,
@@ -422,7 +467,7 @@ export class ProcessExternalSaleConfirmationUseCase {
       discountAmount: 0,
       taxAmount: parseFloat(l.unit_price) * 0.2,
       totalPrice: parseFloat(l.total_price),
-      currency: row.currency,
+      currency: row.currency as CurrencyCode,
       exchangeRate: 1.0,
     }));
 
@@ -444,16 +489,16 @@ export class ProcessExternalSaleConfirmationUseCase {
       commissionRate: parseFloat(row.gross_price) > 0 ? parseFloat(row.commission_paid) / parseFloat(row.gross_price) : 0,
       commissionPaid: parseFloat(row.commission_paid),
       netRevenue: parseFloat(row.net_revenue),
-      currency: row.currency,
+      currency: row.currency as CurrencyCode,
       exchangeRate: 1.0,
       exchangeRateSource: 'TCMB',
       accountingAmount: parseFloat(row.gross_price),
       lines,
       revenueSplit: {
-        organizerAmount: { minorUnits: BigInt(Math.round(parseFloat(row.net_revenue) * 100)), currency: row.currency, scale: 100 },
-        platformCommission: { minorUnits: BigInt(Math.round(parseFloat(row.commission_paid) * 100)), currency: row.currency, scale: 100 },
-        gatewayFee: { minorUnits: BigInt(0), currency: row.currency, scale: 100 },
-        taxAmount: { minorUnits: BigInt(Math.round(parseFloat(row.gross_price) * 0.2 * 100)), currency: row.currency, scale: 100 },
+        organizerAmount: { minorUnits: BigInt(Math.round(parseFloat(row.net_revenue) * 100)), currency: row.currency as CurrencyCode, scale: 100 },
+        platformCommission: { minorUnits: BigInt(Math.round(parseFloat(row.commission_paid) * 100)), currency: row.currency as CurrencyCode, scale: 100 },
+        gatewayFee: { minorUnits: BigInt(0), currency: row.currency as CurrencyCode, scale: 100 },
+        taxAmount: { minorUnits: BigInt(Math.round(parseFloat(row.gross_price) * 0.2 * 100)), currency: row.currency as CurrencyCode, scale: 100 },
       },
       status: row.status,
       notes: 'Cached PostgreSQL sale record',
