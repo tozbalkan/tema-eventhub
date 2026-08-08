@@ -11,9 +11,11 @@ import { OutboxStore } from '@/platform/OutboxStore';
 import { PgOutboxStore } from '@/platform/pg/PgOutboxStore';
 import { OutboxPublisherWorker } from '@/platform/OutboxPublisherWorker';
 import { bootstrapStageOpsApplication } from '@/application/Bootstrap';
+import { VenueAssetProjection } from '@/operations/projections/VenueAssetProjection';
 
 export interface ProcessExternalSaleConfirmationCommand {
   commandId?: string;
+  organizationId?: string;
   reservationId?: string;
   eventId: string;
   assetId?: string;
@@ -41,7 +43,7 @@ export interface ProcessExternalSaleConfirmationResult {
  * 
  * Production Transaction Flow (Multi-Asset Deterministic Deadlock-Free Pattern):
  * 1. Command Idempotency Check (SELECT existing sale for channel + reference)
- * 2. Database-Authoritative Asset existence & status pre-validation via venue_asset_projections (No Memory Fallback in PG Mode)
+ * 2. Database-Authoritative Asset & Channel Validation (Query venue_asset_projections & sales_channels directly in PostgreSQL)
  * 3. Accurate Heterogeneous Pricing (Sum of base_price across all requested asset projections)
  * 4. Non-Aborting Sale Ownership Reservation FIRST (INSERT INTO sales ON CONFLICT DO NOTHING RETURNING id)
  *    - If duplicate detected: Return existing sale payload WITHOUT mutating asset projections (Zero Phantom Side-Effects!)
@@ -59,10 +61,10 @@ export class ProcessExternalSaleConfirmationUseCase {
     const idempotencyKey = cmd.idempotencyKey || cmd.externalSaleReference;
     const requestedAssetIds = cmd.assetIds && cmd.assetIds.length > 0 ? cmd.assetIds : [cmd.assetId || ''];
 
-    // Deduplicate requested asset IDs for canonical lock ordering and line item processing (P1-2 Fix)
+    // Deduplicate requested asset IDs for canonical lock ordering and line item processing
     const uniqueAssetIds = Array.from(new Set(requestedAssetIds));
 
-    // PostgreSQL Transactional Execution Path
+    // PostgreSQL Transactional Execution Path (Strict DB-Authoritative Mode: No Memory Fallback)
     if (cmd.pgClient) {
       const client = cmd.pgClient;
 
@@ -76,8 +78,7 @@ export class ProcessExternalSaleConfirmationUseCase {
         return this.reconstructDuplicateSaleResponse(client, existingSaleRes.rows[0], cmd);
       }
 
-      // 2. Database-Authoritative Asset Validation: Query venue_asset_projections directly in PostgreSQL!
-      // In PG transaction mode, asset MUST exist in PostgreSQL venue_asset_projections table (No Memory Fallback).
+      // 2. Database-Authoritative Asset Validation: Query venue_asset_projections directly in PostgreSQL
       const assetProjections: Array<{ asset_id: string; name: string; category: string; status: string; base_price: number; currency: CurrencyCode }> = [];
 
       for (const currentAssetId of uniqueAssetIds) {
@@ -114,18 +115,25 @@ export class ProcessExternalSaleConfirmationUseCase {
         assetProjections.push(assetObj);
       }
 
+      // 3. Database-Authoritative SalesChannel Metadata Lookup
+      const channelRes = await client.query('SELECT * FROM sales_channels WHERE id = $1', [cmd.salesChannelId]);
+      let channelName = cmd.salesChannelId;
+      let commissionRate = 0.0;
+
+      if (channelRes.rows.length > 0) {
+        channelName = channelRes.rows[0].name;
+        commissionRate = parseFloat(channelRes.rows[0].commission_percentage || '0') / 100;
+      }
+
       const primaryAsset = assetProjections[0]!;
       const currency: CurrencyCode = primaryAsset.currency || 'TRY';
 
-      // 3. Accurate Heterogeneous Pricing Calculation: Sum exact base_price of all requested asset projections
+      // 4. Accurate Heterogeneous Pricing Calculation
       const grossPrice = assetProjections.reduce((sum, p) => sum + p.base_price, 0);
       const totalTaxAmount = assetProjections.reduce((sum, p) => sum + p.base_price * 0.2, 0);
-
-      const defaultChannel: SalesChannel = { id: 'desk', name: 'Organizasyon Masası', commissionPercentage: 0.0, isArchived: false };
-      const channel = MockDataStore.salesChannels.find((c) => c.id === cmd.salesChannelId) ?? defaultChannel;
-      const commissionRate = channel.commissionPercentage / 100;
       const commissionPaid = grossPrice * commissionRate;
       const netRevenue = grossPrice - commissionPaid;
+      const organizationId = cmd.organizationId || 'org_stageops_01';
 
       const nowISO = new Date().toISOString();
       const commandId = cmd.commandId || IdGenerator.generateUUIDv7();
@@ -153,12 +161,12 @@ export class ProcessExternalSaleConfirmationUseCase {
 
       const sale: Sale = {
         id: saleId,
-        organizationId: MockDataStore.organizationId,
+        organizationId,
         eventId: cmd.eventId,
         reservationId: cmd.reservationId,
         salesChannelId: cmd.salesChannelId,
         externalReference: cmd.externalSaleReference,
-        channel: { type: 'ExternalChannel', name: channel.name, reference: cmd.externalSaleReference },
+        channel: { type: 'ExternalChannel', name: channelName, reference: cmd.externalSaleReference },
         purchaserSnapshot: {
           fullName: cmd.purchaserName || 'Unspecified Purchaser',
           phone: cmd.purchaserPhone || '',
@@ -188,7 +196,7 @@ export class ProcessExternalSaleConfirmationUseCase {
         updatedAt: nowISO,
       };
 
-      // 4. Non-Aborting SQL Sale Ownership Reservation: ON CONFLICT DO NOTHING RETURNING id
+      // 5. Non-Aborting SQL Sale Ownership Reservation: ON CONFLICT DO NOTHING RETURNING id
       const saleQuery = `
         INSERT INTO sales (
           id, organization_id, event_id, reservation_id, sales_channel_id,
@@ -227,7 +235,7 @@ export class ProcessExternalSaleConfirmationUseCase {
         throw new Error('SALE_OWNERSHIP_CONFLICT: Sale conflict detected but existing sale is unavailable.');
       }
 
-      // 5. REAL Multi-Asset Deterministic Lock Ordering (P1-2 Fix): Sort unique asset IDs deterministically BEFORE acquiring locks!
+      // 6. REAL Multi-Asset Deterministic Lock Ordering: Sort unique asset IDs deterministically BEFORE acquiring locks!
       const sortedAssetIds = [...uniqueAssetIds].sort();
       for (const assetIdToLock of sortedAssetIds) {
         const assetProj = assetProjections.find((p) => p.asset_id === assetIdToLock);
@@ -256,7 +264,7 @@ export class ProcessExternalSaleConfirmationUseCase {
         }
       }
 
-      // 6. INSERT Sale lines into PostgreSQL in SAME transaction
+      // 7. INSERT Sale lines into PostgreSQL in SAME transaction
       for (const line of sale.lines) {
         const lineQuery = `
           INSERT INTO sale_lines (id, sale_id, venue_asset_id, quantity, unit_price, total_price)
@@ -265,7 +273,7 @@ export class ProcessExternalSaleConfirmationUseCase {
         await client.query(lineQuery, [line.id, sale.id, line.venueAssetId, line.unitPrice]);
       }
 
-      // 7. INSERT OutboxMessage into PostgreSQL in SAME transaction
+      // 8. INSERT OutboxMessage into PostgreSQL in SAME transaction
       const event: SaleRecordedDomainEvent = {
         eventName: DomainEventNames.SaleRecorded,
         header: {
@@ -291,10 +299,9 @@ export class ProcessExternalSaleConfirmationUseCase {
       };
     }
 
-    // In-Memory Reference Execution Path
+    // In-Memory Execution Path (Parity updated for multi-asset reservations)
     const existingRecord = IdempotencyStore.getRecord(idempotencyKey);
     if (existingRecord && existingRecord.status === 'Completed' && existingRecord.responsePayload) {
-      console.log(`[Idempotency] Returning cached response payload for ref: ${cmd.externalSaleReference}`);
       return existingRecord.responsePayload;
     }
 
@@ -311,17 +318,18 @@ export class ProcessExternalSaleConfirmationUseCase {
     }
 
     try {
-      const primaryAssetId = uniqueAssetIds[0]!;
-      const asset = VenueService.getAssetById(primaryAssetId);
-      if (!asset) {
-        IdempotencyStore.markFailed(idempotencyKey);
-        throw new Error('Asset not found');
-      }
-
-      if (asset.status === 'Sold') {
-        IdempotencyStore.markFailed(idempotencyKey);
-        throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
-      }
+      const assets = uniqueAssetIds.map((aId) => {
+        const a = VenueService.getAssetById(aId);
+        if (!a) {
+          IdempotencyStore.markFailed(idempotencyKey);
+          throw new Error(`Asset not found: ${aId}`);
+        }
+        if (a.status === 'Sold') {
+          IdempotencyStore.markFailed(idempotencyKey);
+          throw new Error('SEAT_ALREADY_RESERVED: Asset is already sold.');
+        }
+        return a;
+      });
 
       const defaultChannel: SalesChannel = {
         id: 'desk',
@@ -331,18 +339,35 @@ export class ProcessExternalSaleConfirmationUseCase {
       };
       const channel = MockDataStore.salesChannels.find((c) => c.id === cmd.salesChannelId) ?? defaultChannel;
       const nowISO = new Date().toISOString();
-      const grossPrice = asset.pricing.basePrice;
+      const grossPrice = assets.reduce((sum, a) => sum + a.pricing.basePrice, 0);
+      const totalTax = assets.reduce((sum, a) => sum + a.pricing.basePrice * 0.2, 0);
       const commissionRate = channel.commissionPercentage / 100;
       const commissionPaid = grossPrice * commissionRate;
       const netRevenue = grossPrice - commissionPaid;
+      const organizationId = cmd.organizationId || MockDataStore.organizationId;
+      const primaryAsset = assets[0]!;
 
       const commandId = cmd.commandId || IdGenerator.generateUUIDv7();
       const correlationId = cmd.correlationId || IdGenerator.generateUUIDv7();
       const saleId = IdGenerator.generateUUIDv7();
 
+      const lines: SaleLine[] = assets.map((a) => ({
+        id: IdGenerator.generateUUIDv7(),
+        saleId,
+        itemType: 'VenueAsset' as const,
+        venueAssetId: a.id,
+        quantity: 1,
+        unitPrice: a.pricing.basePrice,
+        discountAmount: 0,
+        taxAmount: a.pricing.basePrice * 0.2,
+        totalPrice: a.pricing.basePrice,
+        currency: a.pricing.currency as CurrencyCode,
+        exchangeRate: 1.0,
+      }));
+
       const sale: Sale = {
         id: saleId,
-        organizationId: MockDataStore.organizationId,
+        organizationId,
         eventId: cmd.eventId,
         reservationId: cmd.reservationId,
         salesChannelId: cmd.salesChannelId,
@@ -367,30 +392,16 @@ export class ProcessExternalSaleConfirmationUseCase {
         commissionRate,
         commissionPaid,
         netRevenue,
-        currency: asset.pricing.currency,
+        currency: primaryAsset.pricing.currency as CurrencyCode,
         exchangeRate: 1.0,
         exchangeRateSource: 'TCMB',
         accountingAmount: grossPrice,
-        lines: [
-          {
-            id: IdGenerator.generateUUIDv7(),
-            saleId,
-            itemType: 'VenueAsset',
-            venueAssetId: primaryAssetId,
-            quantity: 1,
-            unitPrice: grossPrice,
-            discountAmount: 0,
-            taxAmount: grossPrice * 0.2,
-            totalPrice: grossPrice,
-            currency: asset.pricing.currency,
-            exchangeRate: 1.0,
-          },
-        ],
+        lines,
         revenueSplit: {
-          organizerAmount: { minorUnits: BigInt(Math.round(netRevenue * 100)), currency: asset.pricing.currency, scale: 100 },
-          platformCommission: { minorUnits: BigInt(Math.round(commissionPaid * 100)), currency: asset.pricing.currency, scale: 100 },
-          gatewayFee: { minorUnits: BigInt(0), currency: asset.pricing.currency, scale: 100 },
-          taxAmount: { minorUnits: BigInt(Math.round(grossPrice * 0.2 * 100)), currency: asset.pricing.currency, scale: 100 },
+          organizerAmount: { minorUnits: BigInt(Math.round(netRevenue * 100)), currency: primaryAsset.pricing.currency as CurrencyCode, scale: 100 },
+          platformCommission: { minorUnits: BigInt(Math.round(commissionPaid * 100)), currency: primaryAsset.pricing.currency as CurrencyCode, scale: 100 },
+          gatewayFee: { minorUnits: BigInt(0), currency: primaryAsset.pricing.currency as CurrencyCode, scale: 100 },
+          taxAmount: { minorUnits: BigInt(Math.round(totalTax * 100)), currency: primaryAsset.pricing.currency as CurrencyCode, scale: 100 },
         },
         status: 'Completed',
         notes: `${channel.name} dış satış bildirimi işlendi (${cmd.externalSaleReference}).`,
@@ -402,6 +413,11 @@ export class ProcessExternalSaleConfirmationUseCase {
 
       MockDataStore.sales.push(sale);
 
+      assets.forEach((a) => {
+        VenueAssetProjection.updateAssetStatus(a.id, 'Sold', saleId, cmd.reservationId);
+        VenueService.updateAsset(a.id, { status: 'Sold' });
+      });
+
       const event: SaleRecordedDomainEvent = {
         eventName: DomainEventNames.SaleRecorded,
         header: {
@@ -410,7 +426,7 @@ export class ProcessExternalSaleConfirmationUseCase {
           occurredAt: nowISO,
           correlationId,
           causationId: commandId,
-          tenantId: MockDataStore.organizationId,
+          tenantId: organizationId,
           traceId: cmd.traceId,
           spanId: cmd.spanId,
         },

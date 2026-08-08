@@ -13,10 +13,11 @@ import { IdGenerator } from '@/platform/IdGenerator';
 import { OutboxPublisherWorker, PgOutboxAdapter } from '@/platform/OutboxPublisherWorker';
 import { InMemoryEventBus } from '@/application/EventBus';
 import { VenueService } from '@/services/VenueService';
+import { MockDataStore } from '@/repositories/mock/MockRepositories';
 import fs from 'fs';
 import path from 'path';
 
-describe('PostgreSQL Correctness Baseline (T1 - T47 Integration Tests)', () => {
+describe('PostgreSQL Correctness Baseline (T1 - T52 Integration Tests)', () => {
   let pool: Pool;
 
   beforeAll(async () => {
@@ -49,6 +50,13 @@ describe('PostgreSQL Correctness Baseline (T1 - T47 Integration Tests)', () => {
         ('asset_bistro_b4', 'Bistro B4', 'Bistro', 'Available', 'Vacant', 4, 12000, 1, NOW())
       ON CONFLICT (asset_id) DO NOTHING;
     `);
+
+    // Reset MockDataStore assets for in-memory parity tests
+    MockDataStore.assets.forEach((a) => {
+      if (a.id === 'asset_vip_a3' || a.id === 'asset_vip_a4') {
+        a.status = 'Available';
+      }
+    });
   });
 
   it('T1: Concurrent Duplicate Consumer Delivery — UNIQUE(event_id, consumer_name)', async () => {
@@ -1424,6 +1432,9 @@ describe('PostgreSQL Correctness Baseline (T1 - T47 Integration Tests)', () => {
         if (sql.includes('SELECT * FROM venue_asset_projections')) {
           return { rows: [{ asset_id: 'asset_vip_a2', name: 'VIP A2', category: 'VIP', status: 'Available', base_price: '25000' }] };
         }
+        if (sql.includes('SELECT * FROM sales_channels')) {
+          return { rows: [{ id: 'biletix', name: 'Biletix', commission_percentage: '6.0' }] };
+        }
         if (sql.includes('INSERT INTO sales')) {
           return { rows: [] }; // Returns 0 rows for ON CONFLICT DO NOTHING
         }
@@ -1467,5 +1478,171 @@ describe('PostgreSQL Correctness Baseline (T1 - T47 Integration Tests)', () => {
         ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
       )
     ).rejects.toThrow(`Asset not found: ${memoryAssetOnlyId}`);
+  });
+
+  it('T48: DB-Authoritative SalesChannel & Commission Test (P1-A Verification)', async () => {
+    // 1. Insert custom sales channel into PostgreSQL sales_channels table
+    await pool.query(
+      `INSERT INTO sales_channels (id, name, commission_percentage)
+       VALUES ('custom_agency', 'Custom Agency Channel', 8.5)
+       ON CONFLICT (id) DO UPDATE SET commission_percentage = 8.5;`
+    );
+
+    const command = {
+      eventId: 'event_gala_2026',
+      assetId: 'asset_vip_a2', // base_price = 25,000 TRY
+      salesChannelId: 'custom_agency',
+      externalSaleReference: 'CUSTOM-CHANNEL-001',
+    };
+
+    const result = await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+    );
+
+    // 2. Verify commission paid is calculated at exactly 8.5% of 25,000 = 2,125.00 TRY from PostgreSQL table!
+    expect(result.sale.commissionRate).toBe(0.085);
+    expect(result.sale.commissionPaid).toBe(2125);
+    expect(result.sale.netRevenue).toBe(22875);
+
+    // 3. Verify PostgreSQL sales table row has commission_paid = 2125.00
+    const dbSale = await pool.query('SELECT * FROM sales WHERE external_reference = $1', [command.externalSaleReference]);
+    expect(parseFloat(dbSale.rows[0].commission_paid)).toBe(2125);
+    expect(parseFloat(dbSale.rows[0].net_revenue)).toBe(22875);
+  });
+
+  it('T49: DB-Authoritative Organization Identity Test (P1-A Verification)', async () => {
+    const customOrgId = 'org_enterprise_dynamic_99';
+
+    const command = {
+      eventId: 'event_gala_2026',
+      assetId: 'asset_vip_a2',
+      salesChannelId: 'biletix',
+      externalSaleReference: 'ORG-IDENTITY-001',
+      organizationId: customOrgId,
+    };
+
+    const result = await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+    );
+
+    // 1. Assert organizationId in returned sale payload matches command
+    expect(result.sale.organizationId).toBe(customOrgId);
+
+    // 2. Assert PostgreSQL sales table stores exact organization_id
+    const dbSale = await pool.query('SELECT * FROM sales WHERE external_reference = $1', [command.externalSaleReference]);
+    expect(dbSale.rows[0].organization_id).toBe(customOrgId);
+
+    // 3. Assert PostgreSQL outbox message payload contains matching tenantId / organizationId
+    const outboxRes = await pool.query('SELECT * FROM outbox_messages WHERE aggregate_id = $1', [result.sale.id]);
+    const payload = outboxRes.rows[0].payload;
+    expect(payload.header.tenantId).toBe(customOrgId);
+  });
+
+  it('T50: Multi-Asset In-Memory & PostgreSQL Execution Parity Test (P1-B Verification)', async () => {
+    // 1. In-Memory Execution: Reserve 2 assets ('asset_vip_a3', 'asset_vip_a4')
+    const memCommand = {
+      eventId: 'event_gala_2026',
+      assetIds: ['asset_vip_a3', 'asset_vip_a4'],
+      salesChannelId: 'biletix',
+      externalSaleReference: 'MEM-MULTI-PARITY-001',
+    };
+
+    const memResult = await ProcessExternalSaleConfirmationUseCase.execute(memCommand);
+    expect(memResult.isDuplicateRecord).toBe(false);
+    expect(memResult.sale.lines).toHaveLength(2);
+    expect(memResult.sale.grossPrice).toBe(50000);
+    expect(VenueService.getAssetById('asset_vip_a3')?.status).toBe('Sold');
+    expect(VenueService.getAssetById('asset_vip_a4')?.status).toBe('Sold');
+
+    // 2. PostgreSQL Execution: Reserve 2 assets ('asset_bistro_b1', 'asset_bistro_b2')
+    const pgCommand = {
+      eventId: 'event_gala_2026',
+      assetIds: ['asset_bistro_b1', 'asset_bistro_b2'],
+      salesChannelId: 'passo',
+      externalSaleReference: 'PG-MULTI-PARITY-002',
+    };
+
+    const pgResult = await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({ ...pgCommand, pgClient: tx })
+    );
+
+    expect(pgResult.isDuplicateRecord).toBe(false);
+    expect(pgResult.sale.lines).toHaveLength(2);
+    expect(pgResult.sale.grossPrice).toBe(24000);
+
+    const dbProj1 = await pool.query('SELECT status FROM venue_asset_projections WHERE asset_id = $1', ['asset_bistro_b1']);
+    const dbProj2 = await pool.query('SELECT status FROM venue_asset_projections WHERE asset_id = $1', ['asset_bistro_b2']);
+    expect(dbProj1.rows[0].status).toBe('Sold');
+    expect(dbProj2.rows[0].status).toBe('Sold');
+  });
+
+  it('T51: Tax & Revenue Split Invariant Test (P1-C Verification)', async () => {
+    // Reserve 1 VIP Asset (25,000 TRY) + 1 Bistro Asset (12,000 TRY) = 37,000 TRY gross
+    const command = {
+      eventId: 'event_gala_2026',
+      assetIds: ['asset_vip_a2', 'asset_bistro_b1'],
+      salesChannelId: 'biletix', // 6% commission = 2,220 TRY
+      externalSaleReference: 'TAX-SPLIT-INVARIANT-001',
+    };
+
+    const result = await UnitOfWork.execute((tx) =>
+      ProcessExternalSaleConfirmationUseCase.execute({ ...command, pgClient: tx })
+    );
+
+    const sale = result.sale;
+    expect(sale.grossPrice).toBe(37000);
+    expect(sale.commissionPaid).toBe(2220);
+    expect(sale.netRevenue).toBe(34780);
+
+    // Tax amount per line (20% KDV)
+    const lineVip = sale.lines.find((l) => l.venueAssetId === 'asset_vip_a2');
+    const lineBistro = sale.lines.find((l) => l.venueAssetId === 'asset_bistro_b1');
+
+    expect(lineVip?.taxAmount).toBe(5000);
+    expect(lineBistro?.taxAmount).toBe(2400);
+
+    // Revenue split total tax amount
+    expect(sale.revenueSplit?.taxAmount.minorUnits).toBe(740000n); // 7,400.00 TRY
+    expect(sale.revenueSplit?.organizerAmount.minorUnits).toBe(3478000n); // 34,780.00 TRY
+    expect(sale.revenueSplit?.platformCommission.minorUnits).toBe(222000n); // 2,220.00 TRY
+  });
+
+  it('T52: Accounting Revenue & Commission Entry Balance Invariant Test (P1-C Verification)', async () => {
+    const saleId = IdGenerator.generateUUIDv7();
+    const eventDbId = IdGenerator.generateUUIDv7();
+    const nowISO = new Date().toISOString();
+
+    const event: SaleRecordedDomainEvent = {
+      eventName: DomainEventNames.SaleRecorded,
+      header: { eventId: IdGenerator.generateUUIDv7(), eventVersion: 1, occurredAt: nowISO },
+      saleId,
+      eventId: eventDbId,
+    };
+
+    // Insert sale with gross_price = 25,000 TRY, commission_paid = 1,500 TRY, net_revenue = 23,500 TRY
+    await UnitOfWork.execute(async (tx) => {
+      await tx.query(
+        `INSERT INTO sales (id, organization_id, event_id, sales_channel_id, external_reference, gross_price, commission_paid, net_revenue, currency, status, created_at)
+         VALUES ($1, 'org_01', $2, 'biletix', 'REF-ACC-BALANCE-001', 25000, 1500, 23500, 'TRY', 'Completed', $3);`,
+        [saleId, eventDbId, nowISO]
+      );
+    });
+
+    // Execute Accounting handler
+    await UnitOfWork.execute((tx) => AccountingSaleRecordedHandler.handle(event, tx));
+
+    // Query accounting entries
+    const dbEntries = await pool.query('SELECT * FROM accounting_entries WHERE source_id = $1', [saleId]);
+    expect(dbEntries.rows).toHaveLength(2);
+
+    const revenueEntry = dbEntries.rows.find((r) => r.entry_type === 'SaleRevenue');
+    const commissionEntry = dbEntries.rows.find((r) => r.entry_type === 'PlatformCommission');
+
+    expect(parseFloat(revenueEntry.amount)).toBe(25000);
+    expect(parseFloat(commissionEntry.amount)).toBe(-1500);
+
+    // Ledger balance sum equals net revenue recognized by organizer (23,500 TRY)
+    const ledgerBalanceSum = parseFloat(revenueEntry.amount) + parseFloat(commissionEntry.amount);
+    expect(ledgerBalanceSum).toBe(23500);
   });
 });

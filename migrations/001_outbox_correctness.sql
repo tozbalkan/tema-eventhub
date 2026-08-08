@@ -32,6 +32,23 @@ CREATE TABLE IF NOT EXISTS processed_events (
   PRIMARY KEY (event_id, consumer_name)
 );
 
+-- Sales Channels Table (Authoritative Persistence for Sales Channel Metadata)
+CREATE TABLE IF NOT EXISTS sales_channels (
+  id                    VARCHAR(100) PRIMARY KEY,
+  name                  VARCHAR(200) NOT NULL,
+  commission_percentage NUMERIC(5,2) NOT NULL DEFAULT 0.0,
+  is_archived           BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO sales_channels (id, name, commission_percentage) VALUES
+  ('biletix', 'Biletix', 6.0),
+  ('passo', 'Passo', 5.0),
+  ('bugece', 'Bugece', 3.5),
+  ('desk', 'Organizasyon Masası', 0.0),
+  ('corporate', 'Kurumsal Acente', 2.0)
+ON CONFLICT (id) DO NOTHING;
+
 -- Sales Table (Aggregate Persistence)
 CREATE TABLE IF NOT EXISTS sales (
   id                   UUID PRIMARY KEY,
