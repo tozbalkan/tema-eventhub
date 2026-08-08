@@ -12,7 +12,7 @@ import { IdGenerator } from '@/platform/IdGenerator';
 import fs from 'fs';
 import path from 'path';
 
-describe('PostgreSQL Correctness Baseline (T1 - T38 Integration Tests)', () => {
+describe('PostgreSQL Correctness Baseline (T1 - T39 Integration Tests)', () => {
   let pool: Pool;
 
   beforeAll(async () => {
@@ -243,7 +243,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T38 Integration Tests)', () => {
     expect(opsProjections.rows[0].status).toBe('Sold');
   });
 
-  it('T8: 5 Failed Delivery Attempts -> DeadLetter Status', async () => {
+  it('T8: 5 Failed Delivery Attempts -> DeadLetter Status & Nullified next_retry_at', async () => {
     const eventId = IdGenerator.generateUUIDv7();
     const saleId = IdGenerator.generateUUIDv7();
     const event: SaleRecordedDomainEvent = {
@@ -259,12 +259,15 @@ describe('PostgreSQL Correctness Baseline (T1 - T38 Integration Tests)', () => {
       const claimed = await PgOutboxStore.claimPendingMessages('worker_test', 1, 0);
       const msg = claimed[0]!;
       await PgOutboxStore.markFailed(msg.id, msg.lockedBy!, msg.leaseVersion, `Attempt ${i + 1} failed`);
-      await pool.query('UPDATE outbox_messages SET next_retry_at = NOW() WHERE id = $1', [msg.id]);
+      if (i < 4) {
+        await pool.query('UPDATE outbox_messages SET next_retry_at = NOW() WHERE id = $1', [msg.id]);
+      }
     }
 
     const finalMsg = await PgOutboxStore.getMessageById(eventId);
     expect(finalMsg?.status).toBe('DeadLetter');
     expect(finalMsg?.retryCount).toBe(5);
+    expect(finalMsg?.nextRetryAt).toBeUndefined();
   });
 
   it('T9: DLQ Replay -> Consumer Idempotency Retains Duplicate Safety', async () => {
@@ -916,7 +919,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T38 Integration Tests)', () => {
     expect(duplicateCount).toBe(14);
   });
 
-  it('T32: Basic Database Accessibility & System Catalog Index Definition Sanity Check', async () => {
+  it('T32: System Catalog Index Definition & Unique Constraint Sanity Check', async () => {
     const requiredTables = ['sales', 'sale_lines', 'outbox_messages', 'venue_asset_projections', 'accounting_entries', 'processed_events'];
     const tablesRes = await pool.query(
       `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name = ANY($1)`,
@@ -926,11 +929,22 @@ describe('PostgreSQL Correctness Baseline (T1 - T38 Integration Tests)', () => {
     const foundTables = tablesRes.rows.map((r) => r.table_name);
     expect(foundTables.length).toBe(requiredTables.length);
 
-    const indexRes = await pool.query(`SELECT indexdef FROM pg_indexes WHERE indexname = 'ux_accounting_source_entry'`);
-    expect(indexRes.rows.length).toBe(1);
-    expect(indexRes.rows[0].indexdef.toLowerCase()).toContain('accounting_entries');
-    expect(indexRes.rows[0].indexdef.toLowerCase()).toContain('source_type');
-    expect(indexRes.rows[0].indexdef.toLowerCase()).toContain('source_id');
+    const catalogRes = await pool.query(`
+      SELECT 
+        i.indexname, 
+        ix.indisunique, 
+        pg_get_indexdef(ix.indexrelid) as indexdef
+      FROM pg_indexes i
+      JOIN pg_class c ON c.relname = i.indexname
+      JOIN pg_index ix ON ix.indexrelid = c.oid
+      WHERE i.indexname = 'ux_accounting_source_entry';
+    `);
+
+    expect(catalogRes.rows.length).toBe(1);
+    expect(catalogRes.rows[0].indisunique).toBe(true);
+    expect(catalogRes.rows[0].indexdef.toLowerCase()).toContain('accounting_entries');
+    expect(catalogRes.rows[0].indexdef.toLowerCase()).toContain('source_type');
+    expect(catalogRes.rows[0].indexdef.toLowerCase()).toContain('source_id');
   });
 
   it('T33: Same External Reference + Different Assets Phantom Protection', async () => {
@@ -1148,7 +1162,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T38 Integration Tests)', () => {
     expect(assetBLines.rows.length).toBe(1);
   });
 
-  it('T38: Lease Expiration End-to-End Fencing — Stale worker markPublished is blocked after lease version increments', async () => {
+  it('T38: Lease Expiration End-to-End Fencing — Stale worker markPublished blocked after lease version increments', async () => {
     const eventId = IdGenerator.generateUUIDv7();
     const saleId = IdGenerator.generateUUIDv7();
     const event: SaleRecordedDomainEvent = {
@@ -1182,5 +1196,16 @@ describe('PostgreSQL Correctness Baseline (T1 - T38 Integration Tests)', () => {
 
     const finalOutbox = await PgOutboxStore.getMessageById(eventId);
     expect(finalOutbox?.status).toBe('Published');
+  });
+
+  it('T39: Rollback Error Preservation & Operational Connection Guard — Original business exception is preserved', async () => {
+    const customBusinessError = 'CRITICAL_BUSINESS_INVARIANT_VIOLATION';
+
+    await expect(
+      UnitOfWork.execute(async (client) => {
+        await client.query('SELECT 1');
+        throw new Error(customBusinessError);
+      })
+    ).rejects.toThrow(customBusinessError);
   });
 });

@@ -70,7 +70,7 @@ export class PgOutboxStore {
         FROM outbox_messages
         WHERE (
           status = 'Pending'
-          OR (status = 'Claimed' AND locked_until < NOW())
+          OR (status = 'Claimed' AND locked_until <= NOW())
           OR (
             status = 'Failed'
             AND (next_retry_at IS NULL OR next_retry_at <= NOW())
@@ -120,8 +120,8 @@ export class PgOutboxStore {
   }
 
   /**
-   * Fenced markFailed: Exponential backoff + random jitter + DLQ threshold.
-   * Uses explicit interval arithmetic (NOW() + backoffSeconds * INTERVAL '1 second').
+   * Fenced markFailed: Exponential backoff + random jitter + DLQ threshold + 300s max cap.
+   * Nullifies next_retry_at when status becomes DeadLetter.
    */
   public static async markFailed(
     messageId: string,
@@ -138,7 +138,10 @@ export class PgOutboxStore {
         status = CASE WHEN retry_count + 1 >= max_retries THEN 'DeadLetter' ELSE 'Failed' END,
         retry_count = retry_count + 1,
         last_error = $4,
-        next_retry_at = NOW() + (LEAST(POWER(2, retry_count + 1) + (RANDOM() * POWER(2, retry_count + 1) * 0.25), 300) * INTERVAL '1 second'),
+        next_retry_at = CASE 
+          WHEN retry_count + 1 >= max_retries THEN NULL 
+          ELSE NOW() + (LEAST(POWER(2, retry_count + 1) + (RANDOM() * POWER(2, retry_count + 1) * 0.25), 300) * INTERVAL '1 second')
+        END,
         locked_by = NULL,
         locked_until = NULL
       WHERE id = $1 AND locked_by = $2 AND lease_version = $3;
