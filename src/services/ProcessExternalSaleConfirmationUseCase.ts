@@ -15,7 +15,7 @@ import { VenueAssetProjection } from '@/operations/projections/VenueAssetProject
 
 export interface ProcessExternalSaleConfirmationCommand {
   commandId?: string;
-  organizationId?: string;
+  organizationId?: string; // Tenant identity explicitly supplied by command payload
   reservationId?: string;
   eventId: string;
   assetId?: string;
@@ -41,18 +41,19 @@ export interface ProcessExternalSaleConfirmationResult {
 /**
  * StageOps Application Use Case: Process External Sale Confirmation.
  * 
- * Production Transaction Flow (Multi-Asset Deterministic Deadlock-Free Pattern):
+ * PostgreSQL Transaction Flow (Multi-Asset Deterministic Deadlock-Free Pattern):
  * 1. Command Idempotency Check (SELECT existing sale for channel + reference)
  * 2. Database-Authoritative Asset & Channel Validation (Query venue_asset_projections & sales_channels directly in PostgreSQL)
- * 3. Accurate Heterogeneous Pricing (Sum of base_price across all requested asset projections)
- * 4. Non-Aborting Sale Ownership Reservation FIRST (INSERT INTO sales ON CONFLICT DO NOTHING RETURNING id)
+ * 3. Command-Supplied Tenant Identity (organizationId passed via command payload, persisted transactionally)
+ * 4. Heterogeneous Asset Pricing & VAT-Exclusive Tax Calculation (Sum of base_price across all requested asset projections; 20% KDV on net base_price)
+ * 5. Non-Aborting Sale Ownership Reservation FIRST (INSERT INTO sales ON CONFLICT DO NOTHING RETURNING id)
  *    - If duplicate detected: Return existing sale payload WITHOUT mutating asset projections (Zero Phantom Side-Effects!)
  *    - If conflict occurs but row is uncommitted/unavailable: Throw SALE_OWNERSHIP_CONFLICT to prevent un-owned sale fallthrough
- * 5. Deterministic Asset Lock Ordering (sortedAssetIds = Array.from(new Set(assetIds)).sort()) & Acquisition ONLY IF sale ownership was won!
+ * 6. Deterministic Asset Lock Ordering (sortedAssetIds = Array.from(new Set(assetIds)).sort()) & Acquisition ONLY IF sale ownership was won!
  *    - Input array deduplicated to prevent duplicate line self-lock conflicts.
- *    - If any asset is already sold: Throw SEAT_ALREADY_RESERVED (triggers UnitOfWork ROLLBACK of step 4 sale insert)
- * 6. Persist Sale Lines & OutboxMessage in SAME PostgreSQL Transaction
- * 7. UnitOfWork commits cleanly without 23505 transaction abortion or deadlock hazards
+ *    - If any asset is already sold: Throw SEAT_ALREADY_RESERVED (triggers UnitOfWork ROLLBACK of step 5 sale insert)
+ * 7. Persist Sale Lines & OutboxMessage in SAME PostgreSQL Transaction
+ * 8. UnitOfWork commits cleanly without 23505 transaction abortion or deadlock hazards
  */
 export class ProcessExternalSaleConfirmationUseCase {
   public static async execute(cmd: ProcessExternalSaleConfirmationCommand): Promise<ProcessExternalSaleConfirmationResult> {
@@ -64,7 +65,7 @@ export class ProcessExternalSaleConfirmationUseCase {
     // Deduplicate requested asset IDs for canonical lock ordering and line item processing
     const uniqueAssetIds = Array.from(new Set(requestedAssetIds));
 
-    // PostgreSQL Transactional Execution Path (Strict DB-Authoritative Mode: No Memory Fallback)
+    // PostgreSQL Transactional Execution Path (Database-Authoritative Asset & Channel State Mode)
     if (cmd.pgClient) {
       const client = cmd.pgClient;
 
@@ -128,11 +129,13 @@ export class ProcessExternalSaleConfirmationUseCase {
       const primaryAsset = assetProjections[0]!;
       const currency: CurrencyCode = primaryAsset.currency || 'TRY';
 
-      // 4. Accurate Heterogeneous Pricing Calculation
+      // 4. Pricing & Tax Arithmetic (VAT-Exclusive Baseline: base_price + 20% KDV)
       const grossPrice = assetProjections.reduce((sum, p) => sum + p.base_price, 0);
       const totalTaxAmount = assetProjections.reduce((sum, p) => sum + p.base_price * 0.2, 0);
       const commissionPaid = grossPrice * commissionRate;
       const netRevenue = grossPrice - commissionPaid;
+
+      // Command-Supplied Tenant Identity (explicitly supplied by command or application default)
       const organizationId = cmd.organizationId || 'org_stageops_01';
 
       const nowISO = new Date().toISOString();
@@ -299,7 +302,7 @@ export class ProcessExternalSaleConfirmationUseCase {
       };
     }
 
-    // In-Memory Execution Path (Parity updated for multi-asset reservations)
+    // In-Memory Execution Path (Equivalent multi-asset reservation behavior)
     const existingRecord = IdempotencyStore.getRecord(idempotencyKey);
     if (existingRecord && existingRecord.status === 'Completed' && existingRecord.responsePayload) {
       return existingRecord.responsePayload;

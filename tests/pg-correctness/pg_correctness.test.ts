@@ -1510,7 +1510,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T52 Integration Tests)', () => {
     expect(parseFloat(dbSale.rows[0].net_revenue)).toBe(22875);
   });
 
-  it('T49: DB-Authoritative Organization Identity Test (P1-A Verification)', async () => {
+  it('T49: Command-Supplied Organization Identity Persistence Test (P1-A Verification)', async () => {
     const customOrgId = 'org_enterprise_dynamic_99';
 
     const command = {
@@ -1538,7 +1538,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T52 Integration Tests)', () => {
     expect(payload.header.tenantId).toBe(customOrgId);
   });
 
-  it('T50: Multi-Asset In-Memory & PostgreSQL Execution Parity Test (P1-B Verification)', async () => {
+  it('T50: Multi-Asset Execution Behavior Parity Test (P1-B Verification)', async () => {
     // 1. In-Memory Execution: Reserve 2 assets ('asset_vip_a3', 'asset_vip_a4')
     const memCommand = {
       eventId: 'event_gala_2026',
@@ -1576,7 +1576,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T52 Integration Tests)', () => {
     expect(dbProj2.rows[0].status).toBe('Sold');
   });
 
-  it('T51: Tax & Revenue Split Invariant Test (P1-C Verification)', async () => {
+  it('T51: Tax Arithmetic & Revenue Split Invariant Test (VAT-Exclusive Baseline)', async () => {
     // Reserve 1 VIP Asset (25,000 TRY) + 1 Bistro Asset (12,000 TRY) = 37,000 TRY gross
     const command = {
       eventId: 'event_gala_2026',
@@ -1594,7 +1594,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T52 Integration Tests)', () => {
     expect(sale.commissionPaid).toBe(2220);
     expect(sale.netRevenue).toBe(34780);
 
-    // Tax amount per line (20% KDV)
+    // Tax amount per line (20% KDV on net base price)
     const lineVip = sale.lines.find((l) => l.venueAssetId === 'asset_vip_a2');
     const lineBistro = sale.lines.find((l) => l.venueAssetId === 'asset_bistro_b1');
 
@@ -1607,7 +1607,7 @@ describe('PostgreSQL Correctness Baseline (T1 - T52 Integration Tests)', () => {
     expect(sale.revenueSplit?.platformCommission.minorUnits).toBe(222000n); // 2,220.00 TRY
   });
 
-  it('T52: Accounting Revenue & Commission Entry Balance Invariant Test (P1-C Verification)', async () => {
+  it('T52: Accounting Revenue & Commission Entry Balance Invariant Test', async () => {
     const saleId = IdGenerator.generateUUIDv7();
     const eventDbId = IdGenerator.generateUUIDv7();
     const nowISO = new Date().toISOString();

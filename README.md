@@ -17,25 +17,27 @@ The system is structured around Domain-Driven Design (DDD), Clean Architecture, 
 
 ## PostgreSQL Persistence Model
 
-1. **Strict Database-Authoritative Execution Path**:
-   When `cmd.pgClient` is provided, PostgreSQL is the sole authoritative source for asset validation (`venue_asset_projections`), channel configuration (`sales_channels`), organization identity (`organization_id`), sale persistence (`sales`, `sale_lines`), and outbox messaging (`outbox_messages`). Unrecognized assets in PostgreSQL throw an immediate `Asset not found` error without touching in-memory stores.
-2. **Database Sales Channels Schema**:
+1. **Database-Authoritative Asset & Channel State**:
+   When `cmd.pgClient` is provided, PostgreSQL is the authoritative source for asset validation (`venue_asset_projections`), channel configuration (`sales_channels`), sale persistence (`sales`, `sale_lines`), and outbox messaging (`outbox_messages`). Unrecognized assets in PostgreSQL throw an immediate `Asset not found` error without touching in-memory stores.
+2. **Command-Supplied Tenant Identity**:
+   Tenant identity (`organizationId`) is explicitly supplied by the command payload (`cmd.organizationId`) and persisted transactionally in PostgreSQL (`sales.organization_id`, outbox message `tenantId`).
+3. **Database Sales Channels Schema**:
    Sales channel metadata (including channel name and percentage commission rate) is persisted in the PostgreSQL `sales_channels` table and queried dynamically per transaction.
-3. **Transaction Boundaries**:
+4. **Transaction Boundaries**:
    All database operations for a sale (`sales`, `sale_lines`, `outbox_messages`) execute inside a single PostgreSQL `PoolClient` transaction block managed by `UnitOfWork`.
-4. **Non-Aborting Ownership Reservation**:
+5. **Non-Aborting Ownership Reservation**:
    Sale ownership is reserved first using `INSERT INTO sales (...) ON CONFLICT (sales_channel_id, external_reference) DO NOTHING RETURNING id`. If duplicate ownership is discovered, the query returns 0 rows without aborting the PostgreSQL transaction block (`23505` safe), allowing the application to return the existing sale payload without side-effects.
-5. **Unowned Sale Conflict Exception Guard**:
+6. **Unowned Sale Conflict Exception Guard**:
    If sale insertion returns 0 rows and a subsequent `SELECT` query finds no committed sale row (uncommitted transaction race), the use case throws `SALE_OWNERSHIP_CONFLICT` to prevent un-owned sale fallthrough into asset locking.
-6. **Heterogeneous Asset Pricing & Tax Domain Invariants**:
+7. **Heterogeneous Asset Pricing & Tax Domain Arithmetic**:
    - `grossPrice` = `sum(lines.totalPrice)` (Sum of `base_price` across all requested asset projections).
-   - `taxAmount` per line = `unitPrice * 0.20` (20% KDV tax).
+   - `taxAmount` per line = `unitPrice * 0.20` (VAT-exclusive baseline rate: 20% KDV).
    - `commissionPaid` = `grossPrice * commissionRate` (where `commissionRate` is fetched from PostgreSQL `sales_channels`).
    - `netRevenue` = `grossPrice - commissionPaid`.
    - `accountingAmount` = `grossPrice`.
-7. **Deterministic Asset Lock Ordering**:
+8. **Targeted Multi-Asset Lock Ordering**:
    Multi-seat reservation asset IDs are deduplicated and canonically sorted (`Array.from(new Set(assetIds)).sort()`) prior to acquiring `FOR UPDATE` row locks on `venue_asset_projections`.
-8. **Database Constraints**:
+9. **Database Constraints**:
    - `PRIMARY KEY (id)` on all core tables.
    - `UNIQUE INDEX ux_sales_external_reference ON sales (sales_channel_id, external_reference)`.
    - `UNIQUE INDEX ux_accounting_source_entry ON accounting_entries (organization_id, source_type, source_id, entry_type)`.
@@ -80,10 +82,10 @@ The PostgreSQL correctness integration test suite consists of **52 passed integr
 - **T46 (Unowned Sale Conflict Exception Guard Test)**: Proves `SALE_OWNERSHIP_CONFLICT` exception is thrown when sale ownership reservation returns 0 rows and existing sale is unavailable.
 - **T47 (Strict DB-Authoritative Asset Projection Guard Test)**: Proves that in PostgreSQL transaction mode, an asset missing in PostgreSQL throws `Asset not found` and is never populated from in-memory fallbacks.
 - **T48 (DB-Authoritative SalesChannel & Commission Test)**: Proves sales channel commission percentage is fetched dynamically from PostgreSQL `sales_channels` table.
-- **T49 (DB-Authoritative Organization Identity Test)**: Proves organization identity is dynamically persisted in PostgreSQL `sales` table and outbox payloads.
-- **T50 (Multi-Asset In-Memory & PostgreSQL Execution Parity Test)**: Validates complete behavioral multi-asset reservation parity across both execution modes.
-- **T51 (Tax & Revenue Split Invariant Test)**: Proves 20% KDV tax calculations per line item and aggregate revenue splits match domain contract invariants.
-- **T52 (Accounting Revenue & Commission Entry Balance Invariant Test)**: Proves accounting ledger balance (`SaleRevenue` + `PlatformCommission` = `netRevenue`) maintains double-entry accounting integrity.
+- **T49 (Command-Supplied Organization Identity Persistence Test)**: Proves tenant organization identity supplied by command payload is persisted transactionally in PostgreSQL `sales` table and outbox payloads.
+- **T50 (Multi-Asset Execution Behavior Parity Test)**: Validates equivalent multi-asset reservation execution behavior across both execution paths within test suite scope.
+- **T51 (Tax Arithmetic & Revenue Split Invariant Test)**: Proves 20% KDV tax arithmetic per line item and aggregate revenue splits match domain baseline invariants.
+- **T52 (Accounting Revenue & Commission Entry Balance Invariant Test)**: Proves accounting ledger entry balance (`SaleRevenue` + `PlatformCommission` = `netRevenue`) maintains revenue split entry integrity.
 
 ## Verification Commands
 
@@ -97,14 +99,14 @@ To run the complete PostgreSQL integration test suite:
 DATABASE_URL=postgresql://postgres:stageops@localhost:5433/stageops npx vitest run tests/pg-correctness/
 ```
 
-## Correctness Scope
+## Correctness Scope & Validated Baseline Statement
 
-> **StageOps PostgreSQL persistence path has a validated concurrency correctness baseline covering transactional atomicity, duplicate command races, asset overselling prevention, multi-asset lock ordering, consumer idempotency, outbox leasing, retry/DLQ behavior, sales channel database persistence, pricing/tax domain invariants, and fencing across 52 integration scenarios. The baseline establishes effectively-once business effects for the tested transactional consumers under at-least-once delivery, but does not claim exactly-once external side effects, strict global event ordering, crash-consistent COMMIT ambiguity handling, or high-load performance correctness.**
+> **StageOps PostgreSQL persistence path has a validated transactional and concurrency correctness baseline across 52 integration scenarios. The validated scope covers atomicity, duplicate-command idempotency, overselling prevention, deterministic multi-asset locking, consumer idempotency, outbox leasing and fencing, database-authoritative asset and sales-channel state, and pricing/revenue invariants. External exactly-once effects, commit ambiguity, global event ordering, accounting double-entry semantics, and high-load behavior remain outside the validated scope.**
 
 ## Production Considerations & Limitations
 
 - **At-Least-Once Delivery**: Downstream consumers must remain idempotent.
-- **Commit Ambiguity**: If a network connection drops after PostgreSQL commits but before the client receives `COMMIT` acknowledgment, the client should retry using the SAME `(sales_channel_id, external_reference)`.
+- **Commit Ambiguity**: If a network connection drops after PostgreSQL commits but before the client receives `COMMIT` acknowledgment, the client should retry using the SAME `(sales_channel_id, external_reference)` business idempotency key.
 - **External Side-Effects**: Non-database side-effects (e.g. external HTTP payment webhooks, emails) must be protected by external idempotency keys.
 - **Outbox Worker Heartbeats**: High-latency event dispatches (> 30s) should configure higher lease duration or implement periodic lease renewal.
 
