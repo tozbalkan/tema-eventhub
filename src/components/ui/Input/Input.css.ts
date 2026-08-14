@@ -24,7 +24,7 @@ export const inputElement = style({
   paddingInline: vars.spacing[3],
   fontSize: vars.typography.size.sm,
   outline: 'none',
-  transition: `all ${vars.transition.fast}`,
+  transition: `border-color ${vars.transition.fast}, box-shadow ${vars.transition.fast}`,
 
   ':focus': {
     borderColor: vars.color.borderFocus,

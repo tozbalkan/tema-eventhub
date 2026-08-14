@@ -9,6 +9,9 @@ export const vars = createGlobalTheme(':root', {
     bgSurfaceHover: 'hsl(224 20% 16%)',
     bgSurfaceActive: 'hsl(224 20% 20%)',
     bgGlass: 'hsl(224 22% 12% / 0.75)',
+    bgElevated: 'hsl(224 22% 14% / 0.95)',
+    bgTooltip: 'hsl(224 22% 12% / 0.92)',
+    bgToolbar: 'hsl(224 22% 12% / 0.85)',
 
     // Borders (HSL only)
     borderMuted: 'hsl(224 18% 18%)',
@@ -19,6 +22,7 @@ export const vars = createGlobalTheme(':root', {
     primary: 'hsl(260 85% 65%)',
     primaryHover: 'hsl(260 85% 72%)',
     primaryLight: 'hsl(260 85% 65% / 0.15)',
+    accentCyan: 'hsl(200 80% 55%)',
 
     // Status Colors (HSL only)
     available: 'hsl(142 70% 45%)',
@@ -38,7 +42,15 @@ export const vars = createGlobalTheme(':root', {
   },
   typography: {
     fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
+    family: {
+      sans: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
+      mono: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+    },
     size: {
+      caption: '0.5rem',
+      tag: '0.5625rem',
+      label: '0.625rem',
+      badge: '0.6875rem',
       xs: 'clamp(0.6875rem, 0.65rem + 0.15vw, 0.75rem)',
       sm: 'clamp(0.8125rem, 0.78rem + 0.2vw, 0.875rem)',
       base: 'clamp(0.9375rem, 0.9rem + 0.25vw, 1rem)',
@@ -63,8 +75,12 @@ export const vars = createGlobalTheme(':root', {
   },
   spacing: {
     '0': '0rem',
+    '0.5': '0.125rem',
+    '0.75': '0.1875rem',
     '1': '0.25rem',
+    '1.5': '0.375rem',
     '2': '0.5rem',
+    '2.5': '0.625rem',
     '3': '0.75rem',
     '4': '1rem',
     '5': '1.25rem',
@@ -74,12 +90,30 @@ export const vars = createGlobalTheme(':root', {
     '12': '3rem',
     '16': '4rem',
   },
+  sizing: {
+    iconXs: '0.75rem',
+    iconSm: '0.875rem',
+    iconMd: '1rem',
+    iconLg: '1.25rem',
+    toolbarBtnHeight: '2.125rem',
+    dropdownMinWidth: '12rem',
+    tooltipMinWidth: '10rem',
+    tooltipMaxWidth: '14rem',
+    groupEditInputWidth: '10rem',
+  },
   radii: {
     sm: '0.25rem',
     md: '0.375rem',
     lg: '0.5rem',
     xl: '0.75rem',
     full: '9999rem',
+  },
+  zIndex: {
+    canvas: '1',
+    toolbar: '10',
+    tooltip: '20',
+    overlay: '50',
+    modal: '100',
   },
   shadow: {
     sm: '0 0.0625rem 0.125rem 0 hsl(0 0% 0% / 0.25)',
@@ -89,6 +123,10 @@ export const vars = createGlobalTheme(':root', {
     glowAvailable: '0 0 1rem hsl(142 70% 45% / 0.3)',
     glowReserved: '0 0 1rem hsl(45 90% 50% / 0.3)',
     glowSold: '0 0 1rem hsl(350 80% 55% / 0.3)',
+    glowAvailableStrong: 'hsl(142 70% 45% / 0.4)',
+    glowReservedStrong: 'hsl(45 90% 50% / 0.4)',
+    glowSoldStrong: 'hsl(350 80% 55% / 0.4)',
+    glowBlockedStrong: 'hsl(220 15% 45% / 0.3)',
   },
   transition: {
     fast: '150ms cubic-bezier(0.4, 0, 0.2, 1)',

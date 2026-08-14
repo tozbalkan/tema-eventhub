@@ -5,6 +5,8 @@ import { DomainEventNames, SaleRecordedDomainEvent } from '@/domain/events/Domai
 import { InMemoryEventBus } from '@/application/EventBus';
 import { IdGenerator } from '@/platform/IdGenerator';
 import { ReservationService } from '@/services/ReservationService';
+import { CustomerCrmService } from '@/services/CustomerCrmService';
+import { NotificationService } from '@/services/NotificationService';
 import type { PoolClient } from 'pg';
 
 export interface ProcessExternalSaleConfirmationDTO {
@@ -655,6 +657,20 @@ export class ProcessExternalSaleConfirmationUseCase {
     assets.forEach((a) => {
       a.status = 'Sold';
     });
+
+    // Operational CRM & Transactional Notification integration
+    if (dto.purchaserPhone || dto.purchaserEmail) {
+      CustomerCrmService.upsertCustomer({
+        fullName: dto.purchaserName || 'VIP Misafir',
+        phone: dto.purchaserPhone || '',
+        email: dto.purchaserEmail || '',
+        source: 'Biletix',
+        tags: ['VIP'],
+      });
+    }
+
+    const firstAssetName = assets[0]?.name || 'VIP Masa';
+    NotificationService.sendSaleConfirmationNotification(sale, firstAssetName);
 
     const event: SaleRecordedDomainEvent = {
       eventName: DomainEventNames.SaleRecorded,

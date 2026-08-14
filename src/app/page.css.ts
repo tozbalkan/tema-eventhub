@@ -9,7 +9,8 @@ export const pageContainer = style({
   flexDirection: 'column',
 });
 
-// Mobile-first responsive header
+/* ─── Header ─────────────────────────────────────────────── */
+
 export const header = style({
   minHeight: '4rem',
   borderBottom: `1px solid ${vars.color.borderSubtle}`,
@@ -22,7 +23,7 @@ export const header = style({
   paddingInline: vars.spacing[4],
   position: 'sticky',
   top: 0,
-  zIndex: 100,
+  zIndex: vars.zIndex.overlay,
 
   [`@media (min-width: ${breakpoints.md})`]: {
     flexDirection: 'row',
@@ -70,7 +71,8 @@ export const headerBadgeGroup = style({
   flexWrap: 'wrap',
 });
 
-// Mobile-first single column default, upgrading to 2 columns on tablet & desktop
+/* ─── Main Grid ──────────────────────────────────────────── */
+
 export const mainGrid = style({
   display: 'grid',
   gridTemplateColumns: '1fr',
@@ -79,29 +81,27 @@ export const mainGrid = style({
   flex: 1,
 
   [`@media (min-width: ${breakpoints.md})`]: {
-    gridTemplateColumns: 'minmax(0, 2fr) minmax(18rem, 1fr)',
-    gap: vars.spacing[6],
-    padding: vars.spacing[6],
-  },
-
-  [`@media (min-width: ${breakpoints.xl})`]: {
-    gridTemplateColumns: 'minmax(0, 2fr) minmax(22rem, 26rem)',
+    gridTemplateColumns: 'minmax(0, 3.5fr) minmax(18rem, 21rem)',
+    gap: vars.spacing[5],
+    padding: vars.spacing[5],
   },
 });
 
+/* ─── Floor Plan Panel ───────────────────────────────────── */
+
 export const floorPlanPanel = style({
   backgroundColor: vars.color.bgSurface,
-  borderColor: vars.color.borderSubtle,
-  borderWidth: '1px',
-  borderStyle: 'solid',
+  border: `1px solid ${vars.color.borderSubtle}`,
   borderRadius: vars.radii.xl,
   padding: vars.spacing[4],
   display: 'flex',
   flexDirection: 'column',
   gap: vars.spacing[4],
+  minHeight: '44rem',
+  flex: 1,
 
   [`@media (min-width: ${breakpoints.md})`]: {
-    padding: vars.spacing[6],
+    padding: vars.spacing[5],
   },
 });
 
@@ -118,7 +118,7 @@ export const floorPlanHeader = style({
 });
 
 export const floorPlanTitle = style({
-  fontSize: vars.typography.size.xl,
+  fontSize: vars.typography.size.lg,
   fontWeight: vars.typography.weight.bold,
 });
 
@@ -128,37 +128,7 @@ export const floorPlanSubTitle = style({
   marginTop: vars.spacing[1],
 });
 
-export const floorPlanBadgeGroup = style({
-  display: 'flex',
-  gap: vars.spacing[2],
-});
-
-// SVG-first fluid container with aspect-ratio: 16 / 10
-export const svgCanvasContainer = style({
-  width: '100%',
-  aspectRatio: '16 / 10',
-  backgroundColor: vars.color.bgPrimary,
-  borderRadius: vars.radii.lg,
-  border: `1px solid ${vars.color.borderMuted}`,
-  position: 'relative',
-  overflow: 'hidden',
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-  touchAction: 'manipulation',
-});
-
-export const svgCanvasElement = style({
-  userSelect: 'none',
-});
-
-export const svgGroupAsset = style({
-  cursor: 'pointer',
-});
-
-export const svgGroupStage = style({
-  cursor: 'default',
-});
+/* ─── Sidebar ────────────────────────────────────────────── */
 
 export const sidebarPanel = style({
   display: 'flex',
@@ -166,11 +136,11 @@ export const sidebarPanel = style({
   gap: vars.spacing[3],
 });
 
+/* ─── Cards (for timeline and tasks) ─────────────────────── */
+
 export const card = style({
   backgroundColor: vars.color.bgSurface,
-  borderColor: vars.color.borderSubtle,
-  borderWidth: '1px',
-  borderStyle: 'solid',
+  border: `1px solid ${vars.color.borderSubtle}`,
   borderRadius: vars.radii.xl,
   padding: vars.spacing[4],
   display: 'flex',
@@ -204,6 +174,8 @@ export const accordionContent = style({
   flexDirection: 'column',
   gap: vars.spacing[3],
 });
+
+/* ─── KPI Grid ───────────────────────────────────────────── */
 
 export const kpiGrid = style({
   display: 'grid',
@@ -240,40 +212,8 @@ export const textSubtleSm = style({
   color: vars.color.textMed,
 });
 
-// Rich Asset Details Workspace Styles
-export const assetDetailGrid = style({
-  display: 'grid',
-  gridTemplateColumns: '1fr',
-  gap: vars.spacing[2],
-});
+/* ─── Timeline ───────────────────────────────────────────── */
 
-export const assetDetailRow = style({
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'space-between',
-  paddingBlock: vars.spacing[1],
-  borderBottom: `1px solid ${vars.color.borderMuted}`,
-});
-
-export const assetDetailLabel = style({
-  fontSize: vars.typography.size.xs,
-  color: vars.color.textMuted,
-});
-
-export const assetDetailValue = style({
-  fontSize: vars.typography.size.sm,
-  fontWeight: vars.typography.weight.semibold,
-  color: vars.color.textHigh,
-});
-
-export const selectedAssetActions = style({
-  display: 'flex',
-  flexDirection: 'column',
-  gap: vars.spacing[2],
-  marginTop: vars.spacing[2],
-});
-
-// Operational Timeline Stream
 export const timelineStream = style({
   display: 'flex',
   flexDirection: 'column',
@@ -288,12 +228,12 @@ export const timelineItem = style({
   padding: vars.spacing[2],
   backgroundColor: vars.color.bgPrimary,
   borderRadius: vars.radii.md,
-  borderLeft: `0.1875rem solid ${vars.color.primary}`,
+  borderLeft: `${vars.spacing['0.75']} solid ${vars.color.primary}`,
 });
 
 export const timelineTime = style({
   fontSize: vars.typography.size.xs,
-  fontFamily: 'monospace',
+  fontFamily: vars.typography.family.mono,
   color: vars.color.primary,
   fontWeight: vars.typography.weight.bold,
 });
@@ -306,7 +246,8 @@ export const timelineContent = style({
   gap: vars.spacing[1],
 });
 
-// Modal Vanilla Extract Classes
+/* ─── Modal Styles ───────────────────────────────────────── */
+
 export const modalForm = style({
   display: 'flex',
   flexDirection: 'column',
@@ -360,7 +301,7 @@ export const textBold = style({
 
 export const modalTokenCode = style({
   fontSize: vars.typography.size.sm,
-  fontFamily: 'monospace',
+  fontFamily: vars.typography.family.mono,
   marginTop: vars.spacing[1],
   color: vars.color.available,
 });
@@ -369,3 +310,45 @@ export const modalTextError = style({
   fontSize: vars.typography.size.sm,
   color: vars.color.sold,
 });
+
+/* ─── Stats Bar Gap ──────────────────────────────────────── */
+
+export const statsSection = style({
+  paddingBlock: vars.spacing[3],
+});
+
+export const selectField = style({
+  width: '100%',
+  paddingBlock: vars.spacing[2],
+  paddingInline: vars.spacing[3],
+  borderRadius: vars.radii.md,
+  backgroundColor: vars.color.bgPrimary,
+  color: vars.color.textHigh,
+  border: `1px solid ${vars.color.borderSubtle}`,
+  fontSize: vars.typography.size.sm,
+  outline: 'none',
+});
+
+export const canvasFlexWorkspace = style({
+  display: 'flex',
+  flex: 1,
+  minHeight: 0,
+  position: 'relative',
+});
+
+export const modalNoticeBox = style({
+  fontSize: vars.typography.size.xs,
+  color: vars.color.available,
+  display: 'flex',
+  alignItems: 'center',
+  gap: vars.spacing[1.5],
+});
+
+export const modalReservedText = style({
+  color: vars.color.reserved,
+});
+
+export const modalTextMarginBottom = style({
+  marginBottom: vars.spacing[2],
+});
+

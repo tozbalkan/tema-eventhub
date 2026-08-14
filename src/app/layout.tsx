@@ -1,5 +1,5 @@
 import React from 'react';
-import '@/styles/global.css';
+import '@/styles/global.css.ts';
 
 export const metadata = {
   title: 'TemaCC Eventhub - VIP Etkinlik & Operasyon Platformu',

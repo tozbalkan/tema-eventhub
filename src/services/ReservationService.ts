@@ -4,6 +4,8 @@ import { Reservation, CancellationReason } from '@/types/reservation';
 import { VenueService } from './VenueService';
 import { IdGenerator } from '@/platform/IdGenerator';
 import { ClockProvider } from '@/platform/ClockProvider';
+import { CustomerCrmService } from './CustomerCrmService';
+import { NotificationService } from './NotificationService';
 
 export interface CreateReservationDTO {
   eventId: string;
@@ -62,6 +64,16 @@ export class ReservationService {
 
     MockDataStore.reservations.push(reservation);
     asset.status = 'Reserved';
+
+    // Operational CRM & Transactional Notification integration
+    CustomerCrmService.upsertCustomer({
+      fullName: dto.customerName,
+      phone: dto.customerPhone,
+      email: dto.customerEmail,
+      source: 'Phone',
+      tags: ['VIP'],
+    });
+    NotificationService.sendReservationNotification(reservation, asset.name || 'VIP Masa');
 
     return reservation;
   }
